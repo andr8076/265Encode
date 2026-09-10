@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Build 2.5: survive mid-stream resolution/pixel-format changes during VA-API encoding.
+# Build 2.6: add automatic, capability-proven legacy Intel Skylake HEVC support.
 # The VA-API filter chain now normalizes every frame to the input stream's initial
 # dimensions before it reaches the encoder, preventing an incompatible software
 # auto-scaler from being inserted after hwupload.
@@ -11,9 +11,13 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="2.5"
+SCRIPT_VERSION="2.6"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
 HARDWARE_PROBE_SIZE="256x256"
+LEGACY_INTEL_ADDON_COMMIT="374845d19e83431e228f64575ee49c02c3d380b9"
+LEGACY_INTEL_DEVICE_ID=""
+LEGACY_INTEL_ADDON_LOADED="no"
+LEGACY_INTEL_FFMPEG_COMMAND=()
 
 # Values left empty here are either requested interactively or filled with
 # command-line defaults after argument parsing.
@@ -373,6 +377,168 @@ debug_print_command() {
     printf '\n' >&2
 }
 
+legacy_intel_hash_file() {
+    local file="$1"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -- "$file" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
+legacy_intel_download() {
+    local url="$1"
+    local output="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --location --silent --retry 2 --connect-timeout 15 \
+            --output "$output" "$url" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --timeout=15 --tries=3 -O "$output" "$url" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+legacy_intel_host_present() {
+    local device vendor device_id driver
+
+    case ${ENCODE265_INTEL_LEGACY_AUTO:-1} in
+        0|false|FALSE|no|NO|off|OFF) return 1 ;;
+    esac
+    case ${ENCODE265_INTEL_LEGACY_RELEVANT:-auto} in
+        1|true|TRUE|yes|YES|on|ON)
+            LEGACY_INTEL_DEVICE_ID="forced"
+            return 0
+            ;;
+        0|false|FALSE|no|NO|off|OFF) return 1 ;;
+    esac
+
+    [[ $(uname -s 2>/dev/null || true) == Linux && $(uname -m 2>/dev/null || true) == x86_64 ]] || return 1
+
+    for device in /sys/class/drm/renderD*/device; do
+        [[ -r "$device/vendor" && -r "$device/device" ]] || continue
+        read -r vendor < "$device/vendor" || continue
+        read -r device_id < "$device/device" || continue
+        [[ ${vendor,,} == 0x8086 ]] || continue
+        driver=$(basename "$(readlink -f "$device/driver" 2>/dev/null || true)")
+        [[ "$driver" == i915 ]] || continue
+
+        # Intel Gen9 Skylake graphics. P530 is 0x191d. The real encode probe is
+        # still the final authority, so merely matching a PCI ID never enables
+        # the encoder by itself.
+        case ${device_id,,} in
+            0x1902|0x1906|0x190a|0x190b|0x190e|\
+            0x1912|0x1913|0x1915|0x1916|0x1917|0x191a|0x191b|0x191d|0x191e|\
+            0x1921|0x1923|0x1926|0x1927|0x192a|0x192b|0x192d|\
+            0x1932|0x193a|0x193b|0x193d)
+                LEGACY_INTEL_DEVICE_ID="${device_id,,}"
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+legacy_intel_expected_hash() {
+    case "$1" in
+        lib/runtime.sh) printf '%s\n' '244bee0ff92c196fa77b77c29823a201c0c6e6421ee574684271e1ce57a03829' ;;
+        lib/intel-legacy-video.sh) printf '%s\n' 'da778ed38db00a4ec42c17a77d1680c267bf6d12ac6a1ec14c785518e78f3e45' ;;
+        packaging/intel-legacy-runtime/inspect.sh) printf '%s\n' '411e379fc2b265786aa81710fa23773eb1a27b7af08f7f4c0902b2417efb6130' ;;
+        packaging/intel-legacy-runtime/with-runtime.sh) printf '%s\n' '05df69bc171144cf70f5cf43be96e074968eea2e627c76625762bd98010722a5' ;;
+        *) return 1 ;;
+    esac
+}
+
+legacy_intel_fetch_addon_file() {
+    local root="$1"
+    local relative="$2"
+    local expected actual target tmp base
+
+    expected=$(legacy_intel_expected_hash "$relative") || return 1
+    target="$root/$relative"
+    mkdir -p -- "${target%/*}" || return 1
+
+    if [[ -r "$target" ]]; then
+        actual=$(legacy_intel_hash_file "$target" 2>/dev/null || true)
+        [[ ${actual,,} == ${expected,,} ]] && return 0
+    fi
+
+    base="https://raw.githubusercontent.com/andr8076/Hardcore-Archive/$LEGACY_INTEL_ADDON_COMMIT"
+    tmp="$target.download.$$"
+    rm -f -- "$tmp"
+    legacy_intel_download "$base/$relative" "$tmp" || { rm -f -- "$tmp"; return 1; }
+    actual=$(legacy_intel_hash_file "$tmp" 2>/dev/null || true)
+    if [[ ${actual,,} != ${expected,,} ]]; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    mv -f -- "$tmp" "$target"
+}
+
+load_legacy_intel_addon() {
+    local root relative
+    local files=(
+        lib/runtime.sh
+        lib/intel-legacy-video.sh
+        packaging/intel-legacy-runtime/inspect.sh
+        packaging/intel-legacy-runtime/with-runtime.sh
+    )
+
+    [[ "$LEGACY_INTEL_ADDON_LOADED" == "yes" ]] && return 0
+
+    root="${XDG_CACHE_HOME:-$HOME/.cache}/265Encode/intel-legacy-addon/$LEGACY_INTEL_ADDON_COMMIT"
+    debug_log "Legacy Intel Skylake hardware detected (${LEGACY_INTEL_DEVICE_ID}); preparing optional compatibility component."
+
+    for relative in "${files[@]}"; do
+        if ! legacy_intel_fetch_addon_file "$root" "$relative"; then
+            debug_log "Could not securely download optional legacy component: $relative"
+            return 1
+        fi
+    done
+
+    HARDCORE_ARCHIVE_ROOT="$root"
+    HARDCORE_ARCHIVE_INTEL_LEGACY_AUTO_SETUP=1
+    export HARDCORE_ARCHIVE_ROOT HARDCORE_ARCHIVE_INTEL_LEGACY_AUTO_SETUP
+
+    # shellcheck source=/dev/null
+    source "$root/lib/runtime.sh" || return 1
+    # shellcheck source=/dev/null
+    source "$root/lib/intel-legacy-video.sh" || return 1
+
+    if ! declare -F hardcore_intel_legacy_probe >/dev/null 2>&1 ||
+       ! declare -F hardcore_intel_legacy_ffmpeg_command >/dev/null 2>&1; then
+        debug_log "Optional legacy component did not expose the expected interface."
+        return 1
+    fi
+
+    LEGACY_INTEL_ADDON_LOADED="yes"
+    return 0
+}
+
+try_legacy_intel_hw() {
+    legacy_intel_host_present || return 1
+    load_legacy_intel_addon || return 1
+
+    debug_log "Running a bounded real HEVC encode probe on the legacy Intel path."
+    if ! hardcore_intel_legacy_probe; then
+        debug_log "Legacy Intel HEVC probe failed: ${HARDCORE_INTEL_LEGACY_ERROR:-unknown error}"
+        return 1
+    fi
+    if ! hardcore_intel_legacy_ffmpeg_command; then
+        debug_log "Legacy Intel runtime passed its probe but no FFmpeg command could be built."
+        return 1
+    fi
+
+    LEGACY_INTEL_FFMPEG_COMMAND=("${HARDCORE_INTEL_LEGACY_COMMAND[@]}")
+    debug_log "Legacy Intel HEVC hardware acceleration was proven and selected."
+    return 0
+}
+
 run_hardware_probe() {
     local label="$1"
     shift
@@ -561,6 +727,9 @@ detect_hw() {
     elif encoder_available "hevc_qsv" && test_simple_encoder "hevc_qsv" "p010le"; then
         HW_TYPE="intel"
         HW_DETAIL="Intel Quick Sync"
+    elif try_legacy_intel_hw; then
+        HW_TYPE="intel-legacy"
+        HW_DETAIL="Intel Skylake legacy Media SDK HEVC (${LEGACY_INTEL_DEVICE_ID})"
     fi
 }
 
@@ -676,6 +845,7 @@ collect_interactive_options() {
             nvidia) echo "2) High Speed - NVIDIA NVENC" ;;
             apple)  echo "2) High Speed - Apple VideoToolbox" ;;
             intel)  echo "2) High Speed - Intel QSV" ;;
+            intel-legacy) echo "2) High Speed - Intel Skylake Legacy QSV" ;;
             vaapi)
                 echo "2) High Speed - AMD/Linux VA-API"
                 echo "   Device: $VAAPI_DEVICE"
@@ -724,6 +894,7 @@ apply_cli_defaults() {
 configure_encoder() {
     local selected_mode="$MODE"
 
+    FFMPEG_COMMAND=(ffmpeg)
     FFMPEG_GLOBAL_ARGS=()
     VIDEO_FILTER_ARGS=()
     VIDEO_ENCODER_ARGS=()
@@ -732,6 +903,19 @@ configure_encoder() {
         AUDIO_ARGS=(-c:a copy)
     else
         AUDIO_ARGS=(-c:a aac -b:a "$AUDIO_BITRATE" -ar 48000)
+    fi
+
+    # Explicit software mode never probes or downloads optional hardware support.
+    if [[ "$selected_mode" == "software" ]]; then
+        ACTIVE_MODE="software"
+        ACTIVE_ENCODER="libx265"
+        VIDEO_ENCODER_ARGS=(
+            -c:v libx265
+            -crf "$SOFTWARE_CRF"
+            -preset "$SOFTWARE_PRESET"
+            -pix_fmt yuv420p10le
+        )
+        return
     fi
 
     detect_hw
@@ -790,6 +974,18 @@ configure_encoder() {
                 -global_quality "$HARDWARE_QP"
                 -preset slow
                 -pix_fmt yuv420p10le
+            )
+            ;;
+        intel-legacy)
+            ACTIVE_ENCODER="Intel Skylake Legacy Quick Sync"
+            FFMPEG_COMMAND=("${LEGACY_INTEL_FFMPEG_COMMAND[@]}")
+            VIDEO_ENCODER_ARGS=(
+                -c:v hevc_qsv
+                -load_plugin hevc_hw
+                -low_power 0
+                -global_quality:v "$HARDWARE_QP"
+                -preset:v medium
+                -pix_fmt nv12
             )
             ;;
         vaapi)
@@ -889,10 +1085,15 @@ build_file_video_filter() {
 
 print_command() {
     local argument
+    local first="yes"
 
-    printf 'ffmpeg'
     for argument in "$@"; do
-        printf ' %q' "$argument"
+        if [[ "$first" == "yes" ]]; then
+            first="no"
+        else
+            printf ' '
+        fi
+        printf '%q' "$argument"
     done
     printf '\n'
 }
@@ -948,7 +1149,7 @@ encode_file() {
     fi
 
     command=(
-        ffmpeg
+        "${FFMPEG_COMMAND[@]}"
         -hide_banner
         -y
         "${FFMPEG_GLOBAL_ARGS[@]}"
@@ -970,7 +1171,7 @@ encode_file() {
     fi
 
     if [[ "$DRY_RUN" == "yes" ]]; then
-        print_command "${command[@]:1}"
+        print_command "${command[@]}"
         return 0
     fi
 
