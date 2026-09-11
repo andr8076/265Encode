@@ -42,7 +42,7 @@ jobs:
           set -Eeuo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add 265Encode.sh tools/legacy-intel.sh legacy-intel.sh
+          git add -A
           git commit -m 'Move legacy Intel helper into tools'
           git push origin HEAD:main
 
