@@ -1,0 +1,37 @@
+name: Legacy Intel calibration checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '265Encode.sh'
+      - 'tools/legacy-intel-calibration.py'
+      - 'tools/test_legacy_intel_calibration.py'
+      - '.github/workflows/legacy-calibration-tests.yml'
+  pull_request:
+    paths:
+      - '265Encode.sh'
+      - 'tools/legacy-intel-calibration.py'
+      - 'tools/test_legacy_intel_calibration.py'
+      - '.github/workflows/legacy-calibration-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test calibration policy
+        run: python3 tools/test_legacy_intel_calibration.py
+      - name: Check encoder shell syntax
+        run: bash -n 265Encode.sh
+      - name: Verify safe fallback remains pinned
+        shell: bash
+        run: |
+          actual=$(sha256sum tools/legacy-intel-calibration.py | awk '{print $1}')
+          grep -Fq "LEGACY_INTEL_CALIBRATOR_SHA256=\"$actual\"" 265Encode.sh
+          grep -Fq -- '-i_qfactor -0.8421052632' 265Encode.sh
+          grep -Fq -- '-b_qfactor 0.9473684211' 265Encode.sh
+          grep -Fq -- '-bf 6 -refs 4 -g 600' 265Encode.sh
