@@ -1,0 +1,20 @@
+diff --git a/libavcodec/qsvenc.c b/libavcodec/qsvenc.c
+--- a/libavcodec/qsvenc.c
++++ b/libavcodec/qsvenc.c
+@@ -954,10 +954,12 @@ static int init_video_param(AVCodecContext *avctx, QSVEncContext *q)
+         break;
+     }
+ 
+-    // The HEVC encoder plugin currently fails with some old libmfx version if coding options
+-    // are provided. Can't find the extract libmfx version which fixed it, just enable it from
+-    // V1.28 in order to keep compatibility security.
+-    if (((avctx->codec_id != AV_CODEC_ID_HEVC) || QSV_RUNTIME_VERSION_ATLEAST(q->ver, 1, 28))
++    // 265Encode legacy Intel compatibility runtime:
++    // Skylake's HEVC implementation can reject these extended coding-option
++    // buffers even though the final Media SDK reports API 1.35. This FFmpeg is
++    // isolated and dedicated to that legacy HEVC path, so omit the buffers for
++    // HEVC instead of applying the API-version heuristic.
++    if ((avctx->codec_id != AV_CODEC_ID_HEVC)
+         && (avctx->codec_id != AV_CODEC_ID_VP9)) {
+         q->extco.Header.BufferId      = MFX_EXTBUFF_CODING_OPTION;
+         q->extco.Header.BufferSz      = sizeof(q->extco);

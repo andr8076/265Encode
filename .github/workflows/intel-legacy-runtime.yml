@@ -1,0 +1,73 @@
+name: 265Encode Intel legacy runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/intel-legacy-runtime.yml"
+      - "legacy-intel.sh"
+      - "packaging/intel-legacy-runtime/**"
+  pull_request:
+    paths:
+      - ".github/workflows/intel-legacy-runtime.yml"
+      - "packaging/intel-legacy-runtime/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  # PR validation must not cancel the branch push that publishes the runtime.
+  group: intel-legacy-runtime-latest-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-isolated-runtime:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build-only dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git libdrm-dev libva-dev nasm pkg-config
+      - name: Build pinned compatibility runtime
+        run: bash packaging/intel-legacy-runtime/build.sh
+      - name: Verify runtime isolation
+        run: bash packaging/intel-legacy-runtime/inspect.sh dist/intel-legacy-runtime/runtime
+      - name: Archive compatibility runtime
+        run: |
+          asset=265encode-intel-legacy-runtime-linux-x86_64.tar.gz
+          tar -C dist/intel-legacy-runtime -czf "$asset" runtime
+          sha256sum "$asset" > "$asset.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: intel-legacy-runtime-linux-x86_64
+          path: 265encode-intel-legacy-runtime-linux-x86_64.tar.gz*
+          retention-days: 7
+      - name: Publish pinned rolling compatibility runtime
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tag=intel-legacy-runtime-latest
+          source packaging/intel-legacy-runtime/versions.env
+          source_asset=265encode-intel-legacy-runtime-linux-x86_64.tar.gz
+          versioned="265encode-intel-legacy-runtime-linux-x86_64-${GITHUB_SHA}.tar.gz"
+          cp -- "$source_asset" "$versioned"
+          sha256sum "$versioned" > "$versioned.sha256"
+          printf '%s\n' "$versioned" > 265encode-intel-legacy-runtime-linux-x86_64.current
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" \
+              --title "265Encode Intel legacy compatibility runtime" \
+              --notes "Discontinued Intel Media SDK ${INTEL_MEDIA_SDK_VERSION} compatibility runtime. Capability-gated; modern hardware remains preferred. The non-free VA driver is not included." \
+              --prerelease
+          fi
+          gh release upload "$tag" "$versioned" "$versioned.sha256" --clobber
+          gh release upload "$tag" 265encode-intel-legacy-runtime-linux-x86_64.current --clobber
+          gh release edit "$tag" --target "$GITHUB_SHA" --prerelease \
+            --title "265Encode Intel legacy compatibility runtime" \
+            --notes "Latest pinned Intel Media SDK ${INTEL_MEDIA_SDK_VERSION} compatibility runtime. Capability-gated; modern hardware remains preferred. The non-free VA driver is obtained from the user's configured distribution repository and is never installed system-wide."
