@@ -6,12 +6,12 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/intel-legacy-runtime.yml"
-      - "legacy-intel.sh"
-      - "packaging/intel-legacy-runtime/**"
+      - "tools/legacy-intel.sh"
+      - "tools/packaging/intel-legacy-runtime/**"
   pull_request:
     paths:
       - ".github/workflows/intel-legacy-runtime.yml"
-      - "packaging/intel-legacy-runtime/**"
+      - "tools/packaging/intel-legacy-runtime/**"
 
 permissions:
   contents: write
@@ -33,9 +33,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake git libdrm-dev libva-dev nasm pkg-config
       - name: Build pinned compatibility runtime
-        run: bash packaging/intel-legacy-runtime/build.sh
+        run: bash tools/packaging/intel-legacy-runtime/build.sh
       - name: Verify runtime isolation
-        run: bash packaging/intel-legacy-runtime/inspect.sh dist/intel-legacy-runtime/runtime
+        run: bash tools/packaging/intel-legacy-runtime/inspect.sh dist/intel-legacy-runtime/runtime
       - name: Archive compatibility runtime
         run: |
           asset=265encode-intel-legacy-runtime-linux-x86_64.tar.gz
@@ -54,7 +54,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           tag=intel-legacy-runtime-latest
-          source packaging/intel-legacy-runtime/versions.env
+          source tools/packaging/intel-legacy-runtime/versions.env
           source_asset=265encode-intel-legacy-runtime-linux-x86_64.tar.gz
           versioned="265encode-intel-legacy-runtime-linux-x86_64-${GITHUB_SHA}.tar.gz"
           cp -- "$source_asset" "$versioned"
