@@ -33,6 +33,7 @@ START_CONFIRM=""
 DRY_RUN="no"
 LIST_HARDWARE_ONLY="no"
 DEBUG_HARDWARE="no"
+LEGACY_INTEL_AUTO="${ENCODE265_INTEL_LEGACY_AUTO:-1}"
 SOFTWARE_CRF="20"
 SOFTWARE_PRESET="slow"
 HARDWARE_QP="24"
@@ -89,6 +90,7 @@ Operation:
       --dry-run            Show FFmpeg commands without running them
       --list-hardware      Detect and display the available HEVC path
       --debug-hardware     Show hardware probe commands and full errors
+      --no-legacy-intel    Disable optional legacy Intel fallback for this run
   -h, --help               Show this help
       --version            Show the script version
 
@@ -288,6 +290,10 @@ parse_arguments() {
                 DEBUG_HARDWARE="yes"
                 shift
                 ;;
+            --no-legacy-intel)
+                LEGACY_INTEL_AUTO=0
+                shift
+                ;;
             --)
                 shift
                 while (( $# > 0 )); do
@@ -402,7 +408,7 @@ legacy_intel_download() {
 
 legacy_intel_host_present() {
     local device vendor device_id driver
-    case ${ENCODE265_INTEL_LEGACY_AUTO:-1} in 0|false|FALSE|no|NO|off|OFF) return 1 ;; esac
+    case ${LEGACY_INTEL_AUTO:-1} in 0|false|FALSE|no|NO|off|OFF) return 1 ;; esac
     [[ $(uname -s 2>/dev/null || true) == Linux && $(uname -m 2>/dev/null || true) == x86_64 ]] || return 1
     for device in /sys/class/drm/renderD*/device; do
         [[ -r "$device/vendor" && -r "$device/device" ]] || continue
