@@ -1,0 +1,71 @@
+name: Finish single-file 265Compare
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/unify-compare-fix.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  unify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Generate and validate single Python comparator
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          helper = Path('tools/265Compare-quality.py').read_text()
+          marker = '\ndef command_plan('
+          if marker not in helper:
+              raise SystemExit('quality helper structure changed')
+          core = helper.split(marker, 1)[0].rstrip() + '\n\n'
+
+          workflow = Path('.github/workflows/unify-compare.yml').read_text()
+          start_marker = "          frontend = r'''"
+          end_marker = "\n          '''\n\n          # The raw string"
+          start = workflow.index(start_marker) + len(start_marker)
+          end = workflow.index(end_marker, start)
+          raw = workflow[start:end]
+          lines = raw.splitlines()
+          if lines:
+              lines = [lines[0]] + [line[10:] if line.startswith('          ') else line for line in lines[1:]]
+          frontend = '\n'.join(lines) + '\n'
+          Path('265Compare.py').write_text(core + frontend, encoding='utf-8')
+          PY
+
+          rm -f 265Compare.sh tools/265Compare-quality.py
+          chmod +x 265Compare.py
+
+          python3 -m py_compile 265Compare.py
+          python3 265Compare.py --help >/dev/null
+          python3 265Compare.py --version | grep -Fxq '265Compare.py 2.0'
+          rm -rf __pycache__
+          ! git grep -n '265Compare-quality.py' -- ':!*.yml'
+          ! git grep -n '265Compare.sh' -- ':!*.yml'
+          git diff --check
+
+          mapfile -t visible < <(find . -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -v '^\.git$' | grep -v '^\.github$' | sort)
+          [[ ${#visible[@]} -eq 2 ]]
+          [[ ${visible[0]} == '265Compare.py' ]]
+          [[ ${visible[1]} == 'tools' ]]
+
+      - name: Commit single-file comparator
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Unify 265Compare into a single Python tool'
+          git push origin HEAD:main
