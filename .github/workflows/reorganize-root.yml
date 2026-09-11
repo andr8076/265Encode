@@ -1,0 +1,80 @@
+name: Reorganize project root
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/reorganize-root.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  reorganize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Move support files under tools and update paths
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p tools
+          git mv 265Encode.sh tools/265Encode.sh
+          git mv 265Compare-quality.py tools/265Compare-quality.py
+          git mv packaging tools/packaging
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          compare = Path('265Compare.sh')
+          text = compare.read_text()
+          text = text.replace('HELPER="$SCRIPT_DIR/265Compare-quality.py"', 'HELPER="$SCRIPT_DIR/tools/265Compare-quality.py"')
+          text = text.replace('https://raw.githubusercontent.com/andr8076/265Encode/main/265Compare-quality.py', 'https://raw.githubusercontent.com/andr8076/265Encode/main/tools/265Compare-quality.py')
+          compare.write_text(text)
+
+          for path in [Path('.github/workflows/intel-legacy-runtime.yml'), Path('.github/workflows/quality-runtime.yml')]:
+              text = path.read_text()
+              text = text.replace('packaging/intel-legacy-runtime', 'tools/packaging/intel-legacy-runtime')
+              text = text.replace('packaging/quality-runtime', 'tools/packaging/quality-runtime')
+              path.write_text(text)
+          PY
+
+          # Verify the root-facing comparison script now resolves/fetches its helper from tools/.
+          grep -Fq 'HELPER="$SCRIPT_DIR/tools/265Compare-quality.py"' 265Compare.sh
+          grep -Fq 'https://raw.githubusercontent.com/andr8076/265Encode/main/tools/265Compare-quality.py' 265Compare.sh
+          ! grep -Fq 'https://raw.githubusercontent.com/andr8076/265Encode/main/265Compare-quality.py' 265Compare.sh
+
+          # The encoder remains functional from tools/ and still fetches the legacy helper from tools/.
+          grep -Fq 'https://raw.githubusercontent.com/andr8076/265Encode/main/tools/legacy-intel.sh' tools/265Encode.sh
+
+          # Workflow build paths must follow the packaging move.
+          grep -Fq 'tools/packaging/intel-legacy-runtime' .github/workflows/intel-legacy-runtime.yml
+          grep -Fq 'tools/packaging/quality-runtime' .github/workflows/quality-runtime.yml
+
+          bash -n 265Compare.sh
+          bash -n tools/265Encode.sh
+          bash -n tools/legacy-intel.sh
+          python3 -m py_compile tools/265Compare-quality.py
+          git diff --check
+
+          # Apart from GitHub's required .github metadata, root should contain only
+          # the public compare entry point and tools directory.
+          mapfile -t visible < <(find . -mindepth 1 -maxdepth 1 -printf '%f\n' | grep -v '^\.git$' | grep -v '^\.github$' | sort)
+          [[ ${#visible[@]} -eq 2 ]]
+          [[ ${visible[0]} == '265Compare.sh' ]]
+          [[ ${visible[1]} == 'tools' ]]
+
+      - name: Commit root cleanup
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Move project support files under tools'
+          git push origin HEAD:main
