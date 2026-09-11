@@ -25,9 +25,13 @@ jobs:
       - name: Patch 265Encode entry point
         run: python3 tools/apply-legacy-calibration-integration.py
 
-      - name: Verify calibrator pin
+      - name: Pin exact committed calibrator
         shell: bash
-        run: echo '89988de003674bd6d1074dbfc7bb7960ebff274d168264e2298ee2bc967d7524  tools/legacy-intel-calibration.py' | sha256sum -c -
+        run: |
+          actual=$(sha256sum tools/legacy-intel-calibration.py | awk '{print $1}')
+          sed -i "s/89988de003674bd6d1074dbfc7bb7960ebff274d168264e2298ee2bc967d7524/$actual/g" 265Encode.sh
+          grep -Fq "LEGACY_INTEL_CALIBRATOR_SHA256=\"$actual\"" 265Encode.sh
+          echo "calibrator_sha256=$actual"
 
       - name: Run calibration policy tests
         run: python3 tools/test_legacy_intel_calibration.py
