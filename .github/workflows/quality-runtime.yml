@@ -5,7 +5,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'packaging/quality-runtime/**'
+      - 'tools/packaging/quality-runtime/**'
       - '.github/workflows/quality-runtime.yml'
 
 permissions:
@@ -49,11 +49,11 @@ jobs:
 
       - name: Build pinned FFmpeg and VMAF runtime
         shell: bash
-        run: bash packaging/quality-runtime/build.sh
+        run: bash tools/packaging/quality-runtime/build.sh
 
       - name: Smoke-test runtime
         shell: bash
-        run: bash packaging/quality-runtime/smoke-test.sh dist/media-runtime/runtime
+        run: bash tools/packaging/quality-runtime/smoke-test.sh dist/media-runtime/runtime
 
       - name: Package runtime
         shell: bash
@@ -111,7 +111,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           tag=quality-runtime-latest
-          source packaging/quality-runtime/versions.env
+          source tools/packaging/quality-runtime/versions.env
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" \
               --target "$GITHUB_SHA" \
