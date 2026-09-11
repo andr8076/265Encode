@@ -1,0 +1,74 @@
+name: Vendor 265Compare quality support
+
+on:
+  push:
+    branches: [compare-tool]
+    paths:
+      - '.github/workflows/vendor-compare-quality.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: compare-tool
+          fetch-depth: 0
+
+      - name: Vendor pinned quality policy and runtime build sources
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          hca=/tmp/hardcore-archive-quality-source
+          rm -rf "$hca"
+          git clone --depth 1 https://github.com/andr8076/Hardcore-Archive.git "$hca"
+          expected=374845d19e83431e228f64575ee49c02c3d380b9
+          actual=$(git -C "$hca" rev-parse HEAD)
+          [[ $actual == "$expected" ]]
+
+          cp "$hca/lib/hardcore-archive-video-quality.py" 265Compare-quality.py
+          mkdir -p packaging/quality-runtime
+          cp "$hca/packaging/media-runtime/build.sh" packaging/quality-runtime/build.sh
+          cp "$hca/packaging/media-runtime/smoke-test.sh" packaging/quality-runtime/smoke-test.sh
+          cp "$hca/packaging/media-runtime/relocate-macos.sh" packaging/quality-runtime/relocate-macos.sh
+          cp "$hca/packaging/media-runtime/versions.env" packaging/quality-runtime/versions.env
+          cp "$hca/.github/workflows/media-runtime.yml" .github/workflows/quality-runtime.yml
+
+          for f in packaging/quality-runtime/*; do
+            sed -i \
+              -e 's/Hardcore Archive/265Encode/g' \
+              -e 's/HCA_RUNTIME/ENCODE265_QUALITY_RUNTIME/g' \
+              -e 's/\.hardcore-archive-runtime-build-root/.265encode-quality-runtime-build-root/g' \
+              -e 's/hca-runtime-smoke/265compare-runtime-smoke/g' \
+              "$f"
+          done
+
+          sed -i \
+            -e 's/name: Build media runtime/name: Build 265Compare quality runtime/' \
+            -e "s@'packaging/media-runtime/\*\*'@'packaging/quality-runtime/**'@g" \
+            -e "s@'\.github/workflows/media-runtime.yml'@'.github/workflows/quality-runtime.yml'@g" \
+            -e 's@packaging/media-runtime/@packaging/quality-runtime/@g' \
+            -e 's/hardcore-archive-media-runtime/265encode-quality-runtime/g' \
+            -e 's/media-runtime-latest/quality-runtime-latest/g' \
+            -e 's/Hardcore Archive media runtime/265Encode quality runtime/g' \
+            -e 's/used by Hardcore Archive/used by 265Compare/g' \
+            .github/workflows/quality-runtime.yml
+
+          test "$(sha256sum 265Compare-quality.py | awk '{print $1}')" = "5acd2160930a77557b596fa18d49cc63983b734239a67b3c8615849360f401da"
+          grep -Fq 'quality-runtime-latest' .github/workflows/quality-runtime.yml
+          grep -Fq '265encode-quality-runtime' .github/workflows/quality-runtime.yml
+          ! grep -R -n -E 'Hardcore Archive|HCA_RUNTIME|hardcore-archive-media-runtime' packaging/quality-runtime .github/workflows/quality-runtime.yml
+
+      - name: Commit vendored support
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add 265Compare-quality.py packaging/quality-runtime .github/workflows/quality-runtime.yml
+          git diff --cached --check
+          git commit -m 'Vendor 265Compare quality policy and runtime sources'
+          git push origin HEAD:compare-tool
