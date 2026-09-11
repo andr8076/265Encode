@@ -1,0 +1,127 @@
+name: Apply self-contained legacy migration
+
+on:
+  push:
+    branches: [legacy-self-contained]
+    paths:
+      - ".self-contained-migration-trigger"
+
+permissions:
+  contents: write
+
+jobs:
+  patch-main-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: legacy-self-contained
+          fetch-depth: 0
+      - name: Patch 265Encode main script
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('265Encode.sh')
+          s = p.read_text()
+          s = s.replace('# Build 2.6: add automatic, capability-proven legacy Intel Skylake HEVC support.',
+                        '# Build 2.7: make legacy Intel support fully owned and served by 265Encode.')
+          s = s.replace('SCRIPT_VERSION="2.6"', 'SCRIPT_VERSION="2.7"')
+          s = s.replace('LEGACY_INTEL_ADDON_COMMIT="374845d19e83431e228f64575ee49c02c3d380b9"',
+                        'LEGACY_INTEL_HELPER_URL="https://raw.githubusercontent.com/andr8076/265Encode/main/legacy-intel.sh"\nLEGACY_INTEL_HELPER_SHA256="cc6138e22f2fe22834e99ace011d8ae1fa8a021e7f5e1cbb281596f514756c38"')
+          start = s.index('legacy_intel_hash_file() {')
+          end = s.index('run_hardware_probe() {', start)
+          replacement = r'''legacy_intel_hash_file() {
+              local file="$1"
+              if command -v sha256sum >/dev/null 2>&1; then
+                  sha256sum -- "$file" | awk '{print $1}'
+              elif command -v shasum >/dev/null 2>&1; then
+                  shasum -a 256 -- "$file" | awk '{print $1}'
+              else
+                  return 1
+              fi
+          }
+
+          legacy_intel_download() {
+              local url="$1" output="$2"
+              if command -v curl >/dev/null 2>&1; then
+                  curl --fail --location --silent --retry 2 --connect-timeout 15 --output "$output" "$url" 2>/dev/null
+              elif command -v wget >/dev/null 2>&1; then
+                  wget -q --timeout=15 --tries=3 -O "$output" "$url" 2>/dev/null
+              else
+                  return 1
+              fi
+          }
+
+          legacy_intel_host_present() {
+              local device vendor device_id driver
+              case ${ENCODE265_INTEL_LEGACY_AUTO:-1} in 0|false|FALSE|no|NO|off|OFF) return 1 ;; esac
+              [[ $(uname -s 2>/dev/null || true) == Linux && $(uname -m 2>/dev/null || true) == x86_64 ]] || return 1
+              for device in /sys/class/drm/renderD*/device; do
+                  [[ -r "$device/vendor" && -r "$device/device" ]] || continue
+                  read -r vendor < "$device/vendor" || continue
+                  read -r device_id < "$device/device" || continue
+                  [[ ${vendor,,} == 0x8086 ]] || continue
+                  driver=$(basename "$(readlink -f "$device/driver" 2>/dev/null || true)")
+                  [[ "$driver" == i915 ]] || continue
+                  case ${device_id,,} in
+                      0x1902|0x1906|0x190a|0x190b|0x190e|0x1912|0x1913|0x1915|0x1916|0x1917|0x191a|0x191b|0x191d|0x191e|0x1921|0x1923|0x1926|0x1927|0x192a|0x192b|0x192d|0x1932|0x193a|0x193b|0x193d)
+                          LEGACY_INTEL_DEVICE_ID="${device_id,,}"; return 0 ;;
+                  esac
+              done
+              return 1
+          }
+
+          load_legacy_intel_addon() {
+              local cache helper tmp actual
+              [[ "$LEGACY_INTEL_ADDON_LOADED" == "yes" ]] && return 0
+              cache="${XDG_CACHE_HOME:-$HOME/.cache}/265Encode/intel-legacy-addon"
+              helper="$cache/legacy-intel.sh"
+              mkdir -p "$cache" || return 1
+              if [[ -r "$helper" ]]; then
+                  actual=$(legacy_intel_hash_file "$helper" 2>/dev/null || true)
+              fi
+              if [[ ${actual:-} != "$LEGACY_INTEL_HELPER_SHA256" ]]; then
+                  tmp="$helper.download.$$"
+                  debug_log "Legacy Intel Skylake hardware detected (${LEGACY_INTEL_DEVICE_ID}); downloading optional 265Encode compatibility helper."
+                  legacy_intel_download "$LEGACY_INTEL_HELPER_URL" "$tmp" || { rm -f "$tmp"; return 1; }
+                  actual=$(legacy_intel_hash_file "$tmp" 2>/dev/null || true)
+                  [[ $actual == "$LEGACY_INTEL_HELPER_SHA256" ]] || { rm -f "$tmp"; return 1; }
+                  mv -f "$tmp" "$helper" || return 1
+              fi
+              # shellcheck source=/dev/null
+              source "$helper" || return 1
+              declare -F encode265_legacy_probe >/dev/null 2>&1 || return 1
+              declare -F encode265_legacy_command >/dev/null 2>&1 || return 1
+              LEGACY_INTEL_ADDON_LOADED="yes"
+          }
+
+          try_legacy_intel_hw() {
+              legacy_intel_host_present || return 1
+              load_legacy_intel_addon || return 1
+              debug_log "Running a bounded real HEVC encode probe on the legacy Intel path."
+              if ! encode265_legacy_probe; then
+                  debug_log "Legacy Intel HEVC probe failed: ${ENCODE265_LEGACY_ERROR:-unknown error}"
+                  return 1
+              fi
+              encode265_legacy_command || return 1
+              LEGACY_INTEL_FFMPEG_COMMAND=("${ENCODE265_LEGACY_COMMAND[@]}")
+              debug_log "Legacy Intel HEVC hardware acceleration was proven and selected."
+              return 0
+          }
+
+          '''
+          s = s[:start] + replacement + s[end:]
+          p.write_text(s)
+          PY
+          bash -n 265Encode.sh legacy-intel.sh packaging/intel-legacy-runtime/*.sh
+          ! grep -RniE 'Hardcore-Archive|hardcore-archive|HARDCORE_|HCA_' 265Encode.sh legacy-intel.sh packaging .github/workflows/intel-legacy-runtime.yml
+          git diff --check
+      - name: Commit migration
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add 265Encode.sh
+          git commit -m "Make legacy Intel support self-contained" || exit 0
+          git push origin HEAD:legacy-self-contained
