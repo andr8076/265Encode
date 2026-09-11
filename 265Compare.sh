@@ -143,7 +143,7 @@ human_report
 # from the same project only; no external project dependency is used.
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 HELPER_SHA256="5acd2160930a77557b596fa18d49cc63983b734239a67b3c8615849360f401da"
-HELPER="$SCRIPT_DIR/265Compare-quality.py"
+HELPER="$SCRIPT_DIR/tools/265Compare-quality.py"
 if [[ ! -f $HELPER ]]; then
     CACHE_BASE=${XDG_CACHE_HOME:-"$HOME/.cache"}/265Encode/compare
     mkdir -p "$CACHE_BASE"
@@ -151,7 +151,7 @@ if [[ ! -f $HELPER ]]; then
     if [[ ! -s $HELPER ]]; then
         echo "Downloading 265Compare quality policy helper..."
         curl -fL --retry 3 --connect-timeout 15 \
-            https://raw.githubusercontent.com/andr8076/265Encode/main/265Compare-quality.py \
+            https://raw.githubusercontent.com/andr8076/265Encode/main/tools/265Compare-quality.py \
             -o "$HELPER.tmp"
         if command -v sha256sum >/dev/null; then helper_actual=$(sha256sum "$HELPER.tmp" | awk '{print $1}'); else helper_actual=$(shasum -a 256 "$HELPER.tmp" | awk '{print $1}'); fi
         [[ ${helper_actual,,} == "$HELPER_SHA256" ]] || { echo "265Compare quality helper checksum verification failed." >&2; rm -f "$HELPER.tmp"; exit 3; }
