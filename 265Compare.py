@@ -840,104 +840,522 @@ def higher_quality(encoder: str, quality: int, step: int) -> int | None:
         return candidate if candidate > quality else None
     return None
 
+import hashlib
+import os
+import platform
+import re
+import shutil
+import tarfile
+import tempfile
+import urllib.request
+from pathlib import Path
 
-def command_plan(args: argparse.Namespace) -> int:
-    if args.mode == "full":
-        windows = [Window("full", 0.0, args.duration)]
-    else:
-        windows = plan_uniform_windows(
-            args.duration, args.sample_seconds, args.interval_seconds,
-            args.min_samples, args.max_samples, args.complexity_samples,
-        )
-        short_full = windows and all(w.kind == "short-full" for w in windows)
-        if not short_full and args.complexity_samples > 0:
-            candidates = packet_complexity_candidates(
-                args.input, args.duration, args.sample_seconds,
-                args.complexity_samples, args.ffprobe,
-            )
-            windows = add_complexity_windows(windows, candidates, args.max_samples)
-        windows = snap_windows_to_frame_starts(
-            windows, args.input, args.duration, args.ffprobe
-        )
-    for window in windows:
-        print(f"{window.kind}\t{window.start:.6f}\t{window.length:.6f}")
-    return 0
+VERSION = "2.0"
+DEFAULT_TARGET = 92.0
+SAMPLE_SECONDS = 4.0
+INTERVAL_SECONDS = 300.0
+MIN_SAMPLES = 5
+MAX_SAMPLES = 16
+COMPLEXITY_SAMPLES = 2
+LOW_PERCENTILE = 10.0
+PERCENTILE_DELTA = 4.0
+SUSTAINED_DELTA = 6.0
+SUSTAINED_SECONDS = 1.0
+QUALITY_RELEASE_BASE = "https://github.com/andr8076/265Encode/releases/download/quality-runtime-latest"
 
 
-def command_evaluate(args: argparse.Namespace) -> int:
+@dataclass(frozen=True)
+class QualityTools:
+    ffmpeg: str
+    ffprobe: str
+    env: dict[str, str]
+
+
+def _run(command: list[str], *, env: dict[str, str] | None = None, capture: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        capture_output=capture,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+
+
+def _probe_json(ffprobe: str, path: str, env: dict[str, str] | None = None) -> dict[str, object]:
+    process = _run([
+        ffprobe, "-v", "error", "-show_format", "-show_streams", "-of", "json", path
+    ], env=env)
+    if process.returncode != 0:
+        raise ValueError(process.stderr.strip() or f"ffprobe failed for {path}")
+    return json.loads(process.stdout)
+
+
+def _human_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{value:.2f} TiB"
+
+
+def _number(value: object, default: float = 0.0) -> float:
     try:
-        result = evaluate_manifest(
-            args.manifest, args.duration, args.threshold, args.low_percentile,
-            args.percentile_delta, args.sustained_delta, args.sustained_seconds,
-            reference_path=args.reference, candidate_path=args.candidate,
-            ffprobe=args.ffprobe,
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _fps(value: object) -> float:
+    try:
+        numerator, denominator = str(value).split("/", 1)
+        denominator_value = float(denominator)
+        return float(numerator) / denominator_value if denominator_value else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _bitrate(value: object) -> str:
+    bitrate = _number(value)
+    return f"{bitrate / 1_000_000:.2f} Mb/s" if bitrate else "unknown"
+
+
+def _stream_tags(stream: dict[str, object]) -> str:
+    tags = stream.get("tags") if isinstance(stream.get("tags"), dict) else {}
+    disposition = stream.get("disposition") if isinstance(stream.get("disposition"), dict) else {}
+    bits: list[str] = []
+    if tags.get("language"):
+        bits.append(f"lang={tags['language']}")
+    if tags.get("title"):
+        bits.append(f"title={tags['title']}")
+    if disposition.get("default"):
+        bits.append("default")
+    if disposition.get("forced"):
+        bits.append("forced")
+    if disposition.get("hearing_impaired"):
+        bits.append("hearing-impaired")
+    return ", ".join(bits) if bits else "-"
+
+
+def _media_summary(label: str, path: str, data: dict[str, object]) -> tuple[int, float, dict[str, int]]:
+    fmt = data.get("format") if isinstance(data.get("format"), dict) else {}
+    streams = data.get("streams") if isinstance(data.get("streams"), list) else []
+    size = os.path.getsize(path)
+    duration = _number(fmt.get("duration"))
+    types = ("video", "audio", "subtitle", "data", "attachment")
+    counts = {
+        kind: sum(1 for stream in streams if isinstance(stream, dict) and stream.get("codec_type") == kind)
+        for kind in types
+    }
+    print(f"\n{label}")
+    print("─" * 72)
+    print(f"File:       {path}")
+    print(f"Size:       {_human_bytes(size)} ({size:,} bytes)")
+    print(f"Duration:   {duration:.3f} s")
+    print(f"Container:  {fmt.get('format_long_name') or fmt.get('format_name') or 'unknown'}")
+    print(f"Bitrate:    {_bitrate(fmt.get('bit_rate'))}")
+    print("Tracks:     " + " | ".join(f"{kind}={counts[kind]}" for kind in types))
+    for raw_stream in streams:
+        if not isinstance(raw_stream, dict):
+            continue
+        stream = raw_stream
+        kind = str(stream.get("codec_type", "unknown"))
+        index = stream.get("index", "?")
+        codec = str(stream.get("codec_name", "unknown"))
+        if kind == "video":
+            rate = _fps(stream.get("avg_frame_rate") or stream.get("r_frame_rate") or "0/0")
+            extra = (
+                f"{stream.get('width', '?')}x{stream.get('height', '?')}, "
+                f"{stream.get('pix_fmt', '?')}, {rate:.3f} fps, {_bitrate(stream.get('bit_rate'))}, "
+                f"profile={stream.get('profile', '?')}"
+            )
+            disposition = stream.get("disposition") if isinstance(stream.get("disposition"), dict) else {}
+            if disposition.get("attached_pic"):
+                extra += ", attached-pic"
+        elif kind == "audio":
+            extra = (
+                f"{stream.get('sample_rate', '?')} Hz, {stream.get('channels', '?')} ch, "
+                f"{stream.get('channel_layout', '?')}, {_bitrate(stream.get('bit_rate'))}, "
+                f"profile={stream.get('profile', '?')}"
+            )
+        else:
+            extra = f"codec={codec}"
+        print(f"  #{str(index):<2} {kind:<10} {codec:<14} {extra}; {_stream_tags(stream)}")
+    return size, duration, counts
+
+
+def print_media_comparison(reference: str, candidate: str, ffprobe: str) -> tuple[dict[str, object], dict[str, object]]:
+    reference_data = _probe_json(ffprobe, reference)
+    candidate_data = _probe_json(ffprobe, candidate)
+    ref_size, ref_duration, ref_counts = _media_summary("ORIGINAL", reference, reference_data)
+    cand_size, cand_duration, cand_counts = _media_summary("CANDIDATE", candidate, candidate_data)
+    saving = (1.0 - cand_size / ref_size) * 100.0 if ref_size else 0.0
+    ratio = cand_size / ref_size if ref_size else 0.0
+    print("\nCOMPARISON")
+    print("═" * 72)
+    print(
+        f"Size:       {_human_bytes(ref_size)} -> {_human_bytes(cand_size)}  "
+        f"({saving:+.2f}% saved; candidate={ratio:.3f}x original)"
+    )
+    print(
+        f"Duration:   {ref_duration:.3f}s -> {cand_duration:.3f}s  "
+        f"(delta {cand_duration - ref_duration:+.3f}s)"
+    )
+    for kind in ("video", "audio", "subtitle", "data", "attachment"):
+        mark = "OK" if ref_counts[kind] == cand_counts[kind] else "CHANGED"
+        print(f"{kind.capitalize():<11}{ref_counts[kind]} -> {cand_counts[kind]}  [{mark}]")
+    return reference_data, candidate_data
+
+
+def _download(url: str, destination: Path) -> None:
+    last_error: Exception | None = None
+    for _ in range(3):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "265Compare/2.0"})
+            with urllib.request.urlopen(request, timeout=30) as response, destination.open("wb") as output:
+                shutil.copyfileobj(response, output)
+            return
+        except Exception as exc:  # bounded retry; surfaced if all attempts fail
+            last_error = exc
+    raise RuntimeError(f"download failed: {url}: {last_error}")
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_extract(archive: Path, destination: Path) -> None:
+    root = destination.resolve()
+    with tarfile.open(archive, "r:gz") as tar:
+        for member in tar.getmembers():
+            target = (destination / member.name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError(f"unsafe archive path: {member.name}")
+        tar.extractall(destination)
+
+
+def select_quality_tools() -> QualityTools:
+    override_ffmpeg = os.environ.get("ENCODE265_COMPARE_FFMPEG")
+    override_ffprobe = os.environ.get("ENCODE265_COMPARE_FFPROBE")
+    base_env = os.environ.copy()
+    if override_ffmpeg and override_ffprobe:
+        return QualityTools(override_ffmpeg, override_ffprobe, base_env)
+
+    system_ffmpeg = shutil.which("ffmpeg")
+    system_ffprobe = shutil.which("ffprobe")
+    if system_ffmpeg and system_ffprobe:
+        filters = _run([system_ffmpeg, "-hide_banner", "-filters"], env=base_env)
+        if filters.returncode == 0 and re.search(r"(^|\s)libvmaf(\s|$)", filters.stdout):
+            return QualityTools(system_ffmpeg, system_ffprobe, base_env)
+
+    system_name = platform.system()
+    machine = platform.machine().lower()
+    if system_name == "Linux":
+        os_name = "linux"
+    elif system_name == "Darwin":
+        os_name = "macos"
+    else:
+        raise RuntimeError("Unsupported OS for managed VMAF runtime.")
+    if machine in ("x86_64", "amd64"):
+        arch = "x86_64"
+    elif machine in ("aarch64", "arm64"):
+        arch = "arm64"
+    else:
+        raise RuntimeError("Unsupported architecture for managed VMAF runtime.")
+
+    target = f"{os_name}-{arch}"
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    cache = cache_root / "265Encode" / "quality-runtime" / target
+    runtime = cache / "runtime"
+    ffmpeg = runtime / "bin" / "ffmpeg"
+    ffprobe = runtime / "bin" / "ffprobe"
+
+    if not (ffmpeg.is_file() and os.access(ffmpeg, os.X_OK) and ffprobe.is_file() and os.access(ffprobe, os.X_OK)):
+        cache.mkdir(parents=True, exist_ok=True)
+        print("Downloading optional 265Encode VMAF quality runtime...")
+        pointer = f"265encode-quality-runtime-{target}.current"
+        with tempfile.TemporaryDirectory(prefix="265compare-runtime-", dir=cache) as temp_raw:
+            temp = Path(temp_raw)
+            pointer_path = temp / pointer
+            _download(f"{QUALITY_RELEASE_BASE}/{pointer}", pointer_path)
+            asset = pointer_path.read_text(encoding="utf-8").strip()
+            pattern = rf"265encode-quality-runtime-{re.escape(target)}-[0-9a-f]{{40}}\.tar\.gz"
+            if re.fullmatch(pattern, asset) is None:
+                raise RuntimeError("Invalid runtime pointer.")
+            archive = temp / asset
+            checksum = temp / f"{asset}.sha256"
+            _download(f"{QUALITY_RELEASE_BASE}/{asset}", archive)
+            _download(f"{QUALITY_RELEASE_BASE}/{asset}.sha256", checksum)
+            expected = checksum.read_text(encoding="utf-8").split()[0].lower()
+            actual = _sha256(archive)
+            if re.fullmatch(r"[0-9a-f]{64}", expected) is None or expected != actual:
+                raise RuntimeError("Quality runtime checksum verification failed.")
+            extracted = temp / "extracted"
+            extracted.mkdir()
+            _safe_extract(archive, extracted)
+            staged = extracted / "runtime"
+            if not (staged / "bin" / "ffmpeg").is_file() or not (staged / "bin" / "ffprobe").is_file():
+                raise RuntimeError("Quality runtime archive is incomplete.")
+            replacement = cache / "runtime.new"
+            if replacement.exists():
+                shutil.rmtree(replacement)
+            shutil.move(str(staged), str(replacement))
+            if runtime.exists():
+                shutil.rmtree(runtime)
+            replacement.rename(runtime)
+
+    env = os.environ.copy()
+    if os_name == "linux":
+        lib = str(runtime / "lib")
+        env["LD_LIBRARY_PATH"] = lib + ((":" + env["LD_LIBRARY_PATH"]) if env.get("LD_LIBRARY_PATH") else "")
+        # Timeline-evidence helpers call ffprobe internally; keep their child environment identical.
+        os.environ["LD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH"]
+    return QualityTools(str(ffmpeg), str(ffprobe), env)
+
+
+def _source_geometry(ffprobe: str, reference: str, env: dict[str, str]) -> tuple[float, int, int, str, str]:
+    process = _run([
+        ffprobe, "-v", "error", "-select_streams", "V:0", "-show_streams", "-show_format", "-of", "json", reference
+    ], env=env)
+    if process.returncode != 0:
+        raise ValueError(process.stderr.strip() or "Could not inspect source video.")
+    data = json.loads(process.stdout)
+    streams = data.get("streams") or []
+    if not streams:
+        raise ValueError("Could not determine source video stream.")
+    stream = streams[0]
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    if width <= 0 or height <= 0:
+        raise ValueError("Could not determine source display geometry.")
+    duration = _number((data.get("format") or {}).get("duration"))
+    if duration <= 0:
+        duration = _number(stream.get("duration"))
+    if duration <= 0:
+        raise ValueError("Could not determine source duration.")
+    sar_raw = str(stream.get("sample_aspect_ratio") or "1:1")
+    try:
+        sar_n, sar_d = (int(part) for part in sar_raw.split(":", 1))
+        if sar_n <= 0 or sar_d <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        sar_n = sar_d = 1
+    rotation = 0
+    for side_data in stream.get("side_data_list") or []:
+        if isinstance(side_data, dict) and "rotation" in side_data:
+            try:
+                rotation = int(side_data["rotation"])
+            except (TypeError, ValueError):
+                pass
+    rotation %= 360
+    display_width = max(2, int((width * sar_n / sar_d) / 2.0 + 0.5) * 2)
+    display_height = height
+    if rotation in (90, 270):
+        display_width, display_height = display_height, display_width
+    long_side = max(display_width, display_height)
+    short_side = min(display_width, display_height)
+    if long_side >= 3840 and short_side >= 2160:
+        model, label = "vmaf_4k_v0.6.1", "4K/1.5H"
+    else:
+        model, label = "vmaf_v0.6.1", "1080p/3H"
+    return duration, display_width, display_height, model, label
+
+
+def _quality_plan(candidate: str, duration: float, mode: str, ffprobe: str) -> list[Window]:
+    if mode == "full":
+        return [Window("full", 0.0, duration)]
+    windows = plan_uniform_windows(
+        duration, SAMPLE_SECONDS, INTERVAL_SECONDS, MIN_SAMPLES, MAX_SAMPLES, COMPLEXITY_SAMPLES
+    )
+    short_full = bool(windows) and all(window.kind == "short-full" for window in windows)
+    if not short_full and COMPLEXITY_SAMPLES > 0:
+        candidates = packet_complexity_candidates(
+            candidate, duration, SAMPLE_SECONDS, COMPLEXITY_SAMPLES, ffprobe
         )
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-        print(json.dumps({"policy": POLICY_VERSION, "status": "error", "error": str(exc)}))
-        return 2
-    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    if result["status"] == "pass":
+        windows = add_complexity_windows(windows, candidates, MAX_SAMPLES)
+    return snap_windows_to_frame_starts(windows, candidate, duration, ffprobe)
+
+
+def _escape_filter_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def run_quality_comparison(reference: str, candidate: str, mode: str, target: float) -> int:
+    tools = select_quality_tools()
+    filters = _run([tools.ffmpeg, "-hide_banner", "-filters"], env=tools.env)
+    if filters.returncode != 0 or re.search(r"(^|\s)libvmaf(\s|$)", filters.stdout) is None:
+        raise RuntimeError("Selected FFmpeg does not provide libvmaf.")
+
+    duration, display_width, display_height, model, model_label = _source_geometry(
+        tools.ffprobe, reference, tools.env
+    )
+    windows = _quality_plan(candidate, duration, mode, tools.ffprobe)
+    if not windows:
+        raise RuntimeError("VMAF sample plan was empty.")
+
+    threads = min(8, max(1, os.cpu_count() or 1))
+    ratio = f"{display_width}/{display_height}"
+    normalize = (
+        "scale=w='max(2,trunc(iw*if(eq(sar,0),1,sar)/2)*2)':"
+        "h='max(2,trunc(ih/2)*2)':flags=bicubic:in_range=auto:out_range=tv,setsar=1"
+    )
+    fit = (
+        f"scale=w='if(gt(a,{ratio}),{display_width},-2)':"
+        f"h='if(gt(a,{ratio}),-2,{display_height})':flags=bicubic:in_range=tv:out_range=tv,"
+        f"pad={display_width}:{display_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p"
+    )
+    percentile_floor = target - PERCENTILE_DELTA
+    sustained_floor = target - SUSTAINED_DELTA
+    print("\nVIDEO QUALITY — Hardcore Archive policy")
+    print("═" * 72)
+    print(f"Mode:       {mode}")
+    print(f"Canvas:     {display_width}x{display_height} (source display resolution)")
+    print(f"Model:      {model} ({model_label})")
+    print(
+        f"Target:     VMAF {target:g} | p{LOW_PERCENTILE:g} floor {percentile_floor:.3f} | "
+        f"sustained floor {sustained_floor:.3f} for {SUSTAINED_SECONDS:g}s"
+    )
+    print(f"Samples:    {len(windows)}")
+
+    with tempfile.TemporaryDirectory(prefix="265compare-") as temp_raw:
+        temp = Path(temp_raw)
+        manifest = temp / "manifest.tsv"
+        rows: list[str] = []
+        for index, window in enumerate(windows, 1):
+            log = temp / f"vmaf-{index}.json"
+            log_filter = _escape_filter_value(str(log))
+            graph = (
+                f"[0:v:0]settb=AVTB,setpts=PTS-STARTPTS,{normalize},{fit}[ref];"
+                f"[1:v:0]settb=AVTB,setpts=PTS-STARTPTS,{normalize},{fit}[dist];"
+                f"[dist][ref]libvmaf=model='version={model}':log_fmt=json:log_path={log_filter}:"
+                f"n_threads={threads}:n_subsample=1:ts_sync_mode=nearest"
+            )
+            print(
+                f"Sample {index:2d}/{len(windows):<2d} {window.kind:<10} "
+                f"at {window.start:8.3f}s for {window.length:.3f}s ... ",
+                end="", flush=True,
+            )
+            process = _run([
+                tools.ffmpeg, "-hide_banner", "-v", "error", "-nostdin",
+                "-ss", f"{window.start:.6f}", "-t", f"{window.length:.6f}", "-i", reference,
+                "-ss", f"{window.start:.6f}", "-t", f"{window.length:.6f}", "-i", candidate,
+                "-filter_complex", graph, "-an", "-f", "null", "-",
+            ], env=tools.env)
+            if process.returncode != 0 or not log.is_file() or log.stat().st_size == 0:
+                print("FAILED")
+                diagnostic = process.stderr.strip()
+                if diagnostic:
+                    print(diagnostic, file=sys.stderr)
+                raise RuntimeError("VMAF measurement failed; quality result is not trustworthy.")
+            print("measured")
+            rows.append(f"{window.kind}\t{window.start:.6f}\t{window.length:.6f}\t{log}\n")
+        manifest.write_text("".join(rows), encoding="utf-8")
+
+        try:
+            result = evaluate_manifest(
+                str(manifest), duration, target, LOW_PERCENTILE, PERCENTILE_DELTA,
+                SUSTAINED_DELTA, SUSTAINED_SECONDS,
+                reference_path=reference, candidate_path=candidate, ffprobe=tools.ffprobe,
+            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            print(f"Quality evaluation error: {exc}", file=sys.stderr)
+            return 2
+
+    print("\nQUALITY RESULT")
+    print("═" * 72)
+    print(f"Status:            {str(result.get('status', 'error')).upper()}")
+    print(f"Policy:            {result.get('policy', '?')}")
+    print(f"Mean VMAF:         {float(result.get('mean_vmaf', 0.0)):.3f}")
+    print(f"Worst window mean: {float(result.get('minimum_window_mean', 0.0)):.3f}")
+    print(
+        f"p{result.get('low_percentile', '?')} VMAF:          "
+        f"{float(result.get('low_percentile_vmaf', 0.0)):.3f}  "
+        f"(floor {float(result.get('low_percentile_floor', 0.0)):.3f})"
+    )
+    print(
+        f"Sustained low:     {float(result.get('longest_sustained_seconds', 0.0)):.3f}s  "
+        f"(reject at >= {SUSTAINED_SECONDS:.3f}s below {float(result.get('sustained_floor', 0.0)):.3f})"
+    )
+    print(
+        f"Coverage:          {float(result.get('coverage_seconds', 0.0)):.3f}s / "
+        f"{float(result.get('requested_coverage_seconds', 0.0)):.3f}s requested "
+        f"({float(result.get('coverage_percent', 0.0)):.2f}% of timeline confirmed)"
+    )
+    print(
+        f"VMAF frames:       {result.get('frames', '?')} "
+        f"({result.get('timed_frames', '?')} timing-mapped)"
+    )
+    reasons = result.get("reasons") or []
+    if reasons:
+        print("Reasons:")
+        for reason in reasons:
+            print(f"  - {reason}")
+    if mode == "sampled":
+        print("Scope:             sampled; unsampled timeline regions are not claimed as measured.")
+    else:
+        print("Scope:             full timeline evidence required.")
+    if result.get("status") == "pass":
         return 0
-    if result["status"] == "reject":
+    if result.get("status") == "reject":
         return 3
     return 2
 
 
-def command_retry(args: argparse.Namespace) -> int:
-    try:
-        candidate = higher_quality(args.encoder, args.quality, args.step)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
-    if candidate is None:
-        return 3
-    print(candidate)
-    return 0
-
-
-def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description=__doc__)
-    sub = root.add_subparsers(dest="command", required=True)
-
-    plan = sub.add_parser("plan")
-    plan.add_argument("--input", required=True)
-    plan.add_argument("--duration", type=float, required=True)
-    plan.add_argument("--mode", choices=("sampled", "full"), default="sampled")
-    plan.add_argument("--sample-seconds", type=float, default=4.0)
-    plan.add_argument("--interval-seconds", type=float, default=300.0)
-    plan.add_argument("--min-samples", type=int, default=5)
-    plan.add_argument("--max-samples", type=int, default=16)
-    plan.add_argument("--complexity-samples", type=int, default=2)
-    plan.add_argument("--ffprobe", default="ffprobe")
-    plan.set_defaults(func=command_plan)
-
-    evaluate = sub.add_parser("evaluate")
-    evaluate.add_argument("--manifest", required=True)
-    evaluate.add_argument("--duration", type=float, required=True)
-    evaluate.add_argument("--threshold", type=float, required=True)
-    evaluate.add_argument("--reference", required=True)
-    evaluate.add_argument("--candidate", required=True)
-    evaluate.add_argument("--ffprobe", default="ffprobe")
-    evaluate.add_argument("--low-percentile", type=float, default=10.0)
-    evaluate.add_argument("--percentile-delta", type=float, default=4.0)
-    evaluate.add_argument("--sustained-delta", type=float, default=6.0)
-    evaluate.add_argument("--sustained-seconds", type=float, default=1.0)
-    evaluate.set_defaults(func=command_evaluate)
-
-    retry = sub.add_parser("retry-quality")
-    retry.add_argument("--encoder", required=True)
-    retry.add_argument("--quality", type=int, required=True)
-    retry.add_argument("--step", type=int, default=2)
-    retry.set_defaults(func=command_retry)
-
-    version = sub.add_parser("policy-version")
-    version.set_defaults(func=lambda _args: (print(POLICY_VERSION), 0)[1])
-    return root
+def user_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="265Compare.py",
+        description=(
+            "Compare two media files including size, container/stream metadata, all tracks, "
+            "and Hardcore Archive-style VMAF quality validation."
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--sampled", action="store_const", const="sampled", dest="mode", help="VMAF sampled mode (default)")
+    mode.add_argument("--full", action="store_const", const="full", dest="mode", help="VMAF full-timeline mode (slow)")
+    parser.set_defaults(mode="sampled")
+    parser.add_argument("--no-quality", action="store_true", help="Metadata/size/track comparison only")
+    parser.add_argument("--target", type=float, default=DEFAULT_TARGET, metavar="VMAF", help="Quality target (default: 92)")
+    parser.add_argument("--version", action="version", version=f"265Compare.py {VERSION}")
+    parser.add_argument("original", help="Original/reference media file")
+    parser.add_argument("candidate", help="Encoded/candidate media file")
+    return parser
 
 
 def main() -> int:
-    args = parser().parse_args()
-    return int(args.func(args))
+    args = user_parser().parse_args()
+    if not 0.0 <= args.target <= 100.0:
+        print("--target must be between 0 and 100.", file=sys.stderr)
+        return 2
+    reference = os.path.abspath(args.original)
+    candidate = os.path.abspath(args.candidate)
+    if not os.path.isfile(reference):
+        print(f"Original not found: {args.original}", file=sys.stderr)
+        return 2
+    if not os.path.isfile(candidate):
+        print(f"Candidate not found: {args.candidate}", file=sys.stderr)
+        return 2
+    system_ffprobe = shutil.which("ffprobe")
+    if not system_ffprobe:
+        print("Missing dependency: ffprobe", file=sys.stderr)
+        return 2
+    try:
+        print_media_comparison(reference, candidate, system_ffprobe)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        print(f"Media comparison failed: {exc}", file=sys.stderr)
+        return 2
+    if args.no_quality:
+        return 0
+    try:
+        return run_quality_comparison(reference, candidate, args.mode, args.target)
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        print(f"Metadata comparison completed, but VMAF quality comparison failed: {exc}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":
