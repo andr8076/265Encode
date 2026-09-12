@@ -1,0 +1,323 @@
+diff --git a/265Encode.sh b/265Encode.sh
+index 3285399..7798ebd 100755
+--- a/265Encode.sh
++++ b/265Encode.sh
+@@ -11,13 +11,13 @@
+ set -o pipefail
+ 
+ SCRIPT_NAME="${0##*/}"
+-SCRIPT_VERSION="2.8"
++SCRIPT_VERSION="2.9"
+ COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
+ HARDWARE_PROBE_SIZE="256x256"
+ LEGACY_INTEL_HELPER_URL="https://raw.githubusercontent.com/andr8076/265Encode/main/tools/legacy-intel.sh"
+ LEGACY_INTEL_HELPER_SHA256="cc6138e22f2fe22834e99ace011d8ae1fa8a021e7f5e1cbb281596f514756c38"
+ LEGACY_INTEL_CALIBRATOR_URL="https://raw.githubusercontent.com/andr8076/265Encode/main/tools/legacy-intel-calibration.py"
+-LEGACY_INTEL_CALIBRATOR_SHA256="d7d0a333f55a021136ffcd7b8520cd48657528fa7e7bb3f135367b210dbaf2ea"
++LEGACY_INTEL_CALIBRATOR_SHA256="f81b7bfdd5af9ba4edce0c58baee1b7469da4445381bc92317d5c55c8333f1d8"
+ LEGACY_INTEL_DEVICE_ID=""
+ LEGACY_INTEL_ADDON_LOADED="no"
+ LEGACY_INTEL_FFMPEG_COMMAND=()
+@@ -581,6 +581,15 @@ legacy_intel_set_plan_args() {
+                 -bf 15 -refs 5 -g 600
+             )
+             ;;
++        matched)
++            VIDEO_ENCODER_ARGS=(
++                -c:v hevc_qsv -load_plugin hevc_hw -low_power 0
++                -q:v 18
++                -b_qfactor 1 -b_qoffset 2
++                -preset:v veryslow -pix_fmt nv12
++                -bf 15 -refs 5 -g 600
++            )
++            ;;
+         balanced)
+             VIDEO_ENCODER_ARGS=(
+                 -c:v hevc_qsv -load_plugin hevc_hw -low_power 0
+@@ -653,7 +662,7 @@ configure_legacy_intel_file() {
+ 
+     IFS='|' read -r plan ratio windows provenance <<< "$result"
+     case "$plan" in
+-        compact|efficient|balanced|safe) ;;
++        compact|efficient|matched|balanced|safe) ;;
+         *)
+             debug_log "Legacy Intel calibrator returned invalid plan: $result"
+             echo "Legacy Intel tuning: invalid calibration result; using verified safe preset."
+diff --git a/tools/legacy-intel-calibration.py b/tools/legacy-intel-calibration.py
+index 0ba31c5..ca260b3 100644
+--- a/tools/legacy-intel-calibration.py
++++ b/tools/legacy-intel-calibration.py
+@@ -2,10 +2,12 @@
+ """Bounded content calibration for 265Encode's Intel Gen9 legacy HEVC path.
+ 
+ The safe profile was validated against libx265 CRF20/slow on multiple complete
+-videos. Calibration never tries to predict x265 bitrate. Instead it treats the
+-safe profile as the local quality reference, samples the source, and selects the
+-smallest proven legacy profile that remains inside a conservative VMAF envelope.
+-If anything is unavailable or inconclusive, callers must fall back to ``safe``.
++videos. Calibration samples the source and, when available, builds bounded
++libx265 CRF20/slow reference samples as the quality oracle. It selects the
++smallest proven legacy profile that remains inside a tight VMAF envelope around
++that reference. If the software oracle is unavailable, selection falls back to
++the conservative safe-profile envelope; inconclusive runs still fall back to
++``safe``.
+ """
+ from __future__ import annotations
+ 
+@@ -24,11 +26,14 @@ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Sequence
+ 
+-POLICY_VERSION = "p530-content-calibration-v1"
++POLICY_VERSION = "p530-content-calibration-v2-cpu-oracle"
+ DEFAULT_SAMPLE_SECONDS = 3.0
+ DEFAULT_MAX_WINDOWS = 5
+ MEAN_DELTA_LIMIT = 0.80
+ P10_DELTA_LIMIT = 1.50
++CPU_MEAN_DELTA_LIMIT = 0.60
++CPU_P10_DELTA_LIMIT = 0.90
++CPU_SAMPLE_TIMEOUT_SECONDS = 120
+ ABSOLUTE_MEAN_FLOOR = 92.0
+ ABSOLUTE_P10_FLOOR = 88.0
+ 
+@@ -54,6 +59,13 @@ PROFILES: dict[str, tuple[str, ...]] = {
+         "-bf", "15",
+         "-refs", "5",
+     ),
++    "matched": COMMON_ARGS + (
++        "-q:v", "18",
++        "-b_qfactor", "1",
++        "-b_qoffset", "2",
++        "-bf", "15",
++        "-refs", "5",
++    ),
+     "balanced": COMMON_ARGS + (
+         "-q:v", "18",
+         "-i_qfactor", "-0.7777777778",
+@@ -131,6 +143,21 @@ def candidate_accepts(reference: Sequence[Score], candidate: Sequence[Score]) ->
+     return True
+ 
+ 
++def candidate_matches_cpu(reference: Sequence[Score], candidate: Sequence[Score]) -> bool:
++    if len(reference) != len(candidate) or not reference:
++        return False
++    for cpu, trial in zip(reference, candidate):
++        mean_floor = min(ABSOLUTE_MEAN_FLOOR, cpu.mean - CPU_MEAN_DELTA_LIMIT)
++        p10_floor = min(ABSOLUTE_P10_FLOOR, cpu.p10 - CPU_P10_DELTA_LIMIT)
++        if trial.mean < mean_floor or trial.p10 < p10_floor:
++            return False
++        if cpu.mean - trial.mean > CPU_MEAN_DELTA_LIMIT:
++            return False
++        if cpu.p10 - trial.p10 > CPU_P10_DELTA_LIMIT:
++            return False
++    return True
++
++
+ def _run(command: Sequence[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+     return subprocess.run(
+         list(command),
+@@ -294,6 +321,44 @@ def encode_window(
+     return output.stat().st_size
+ 
+ 
++def encode_cpu_reference_window(
++    ffmpeg: str, source: Path, window: Window, output: Path
++) -> int:
++    command = [
++        ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-y",
++        "-ss", f"{window.start:.6f}", "-t", f"{window.length:.6f}",
++        "-i", str(source), "-map", "0:v:0", "-an", "-sn", "-dn",
++        "-c:v", "libx265", "-crf", "20", "-preset", "slow",
++        "-pix_fmt", "yuv420p10le", "-f", "matroska", str(output),
++    ]
++    try:
++        proc = subprocess.run(
++            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
++            encoding="utf-8", errors="replace", check=False,
++            timeout=CPU_SAMPLE_TIMEOUT_SECONDS,
++        )
++    except subprocess.TimeoutExpired as exc:
++        raise RuntimeError("CPU reference sample timed out") from exc
++    if proc.returncode != 0 or not output.is_file() or output.stat().st_size <= 0:
++        raise RuntimeError(f"CPU reference sample failed: {proc.stderr.strip()}")
++    return output.stat().st_size
++
++
++def software_encoder_fingerprint(ffmpeg: str) -> str:
++    resolved = shutil.which(ffmpeg) or ffmpeg
++    proc = _run([resolved, "-hide_banner", "-encoders"])
++    if proc.returncode != 0:
++        raise RuntimeError("system FFmpeg encoder inventory unavailable")
++    line = next((line for line in proc.stdout.splitlines() if "libx265" in line), "")
++    if not line:
++        raise RuntimeError("system FFmpeg libx265 reference encoder unavailable")
++    version = _run([resolved, "-version"])
++    if version.returncode != 0 or not version.stdout.splitlines():
++        raise RuntimeError("system FFmpeg version unavailable")
++    payload = "\0".join([str(Path(resolved).resolve()), version.stdout.splitlines()[0], line.strip()])
++    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
++
++
+ def score_window(
+     ffmpeg: Path,
+     env: dict[str, str],
+@@ -331,6 +396,7 @@ def cache_key(
+     source: Path,
+     legacy_manifest: Path,
+     quality_manifest: Path,
++    software_fingerprint: str,
+     sample_seconds: float,
+     max_windows: int,
+ ) -> str:
+@@ -342,6 +408,7 @@ def cache_key(
+         str(stat.st_mtime_ns),
+         _manifest_hash(legacy_manifest),
+         _manifest_hash(quality_manifest),
++        software_fingerprint,
+         f"{sample_seconds:.6f}",
+         str(max_windows),
+     ])
+@@ -356,10 +423,16 @@ def calibrate(args: argparse.Namespace) -> tuple[str, float, int, bool]:
+     cache_root = Path(args.cache_root).expanduser().resolve()
+     cache_root.mkdir(parents=True, exist_ok=True)
+ 
++    try:
++        software_fingerprint = software_encoder_fingerprint(args.software_ffmpeg)
++    except Exception:
++        software_fingerprint = "unavailable"
++
+     key = cache_key(
+         source,
+         legacy_runtime / "runtime-manifest.txt",
+         quality_runtime / "runtime-manifest.txt",
++        software_fingerprint,
+         args.sample_seconds,
+         args.max_windows,
+     )
+@@ -389,10 +462,10 @@ def calibrate(args: argparse.Namespace) -> tuple[str, float, int, bool]:
+ 
+     legacy_env = build_legacy_env(legacy_runtime, driver_dir)
+     results: dict[str, tuple[list[Score], int]] = {}
+-
+     work = Path(tempfile.mkdtemp(prefix="265encode-legacy-calibration.", dir=str(cache_root)))
+     try:
+-        for profile in ("safe", "compact", "efficient", "balanced"):
++        profile_order = ("safe", "compact", "efficient", "matched", "balanced")
++        for profile in profile_order:
+             scores: list[Score] = []
+             total_bytes = 0
+             profile_dir = work / profile
+@@ -411,11 +484,39 @@ def calibrate(args: argparse.Namespace) -> tuple[str, float, int, bool]:
+             results[profile] = (scores, total_bytes)
+ 
+         safe_scores, safe_bytes = results["safe"]
++        oracle_scores: list[Score] | None = None
++        if software_fingerprint != "unavailable":
++            try:
++                oracle_dir = work / "cpu-oracle"
++                oracle_dir.mkdir()
++                oracle_scores = []
++                for index, window in enumerate(windows):
++                    encoded = oracle_dir / f"{index}.mkv"
++                    vmaf_log = oracle_dir / f"{index}.json"
++                    encode_cpu_reference_window(args.software_ffmpeg, source, window, encoded)
++                    oracle_scores.append(
++                        score_window(
++                            quality_ffmpeg, quality_env, source, encoded, window, vmaf_log
++                        )
++                    )
++            except Exception:
++                oracle_scores = None
+         qualifying: list[tuple[int, str]] = [(safe_bytes, "safe")]
+-        for profile in ("compact", "efficient", "balanced"):
+-            scores, size = results[profile]
+-            if candidate_accepts(safe_scores, scores):
+-                qualifying.append((size, profile))
++        if oracle_scores is not None:
++            qualifying = []
++            for profile in profile_order:
++                scores, size = results[profile]
++                if candidate_matches_cpu(oracle_scores, scores):
++                    qualifying.append((size, profile))
++            if not qualifying:
++                qualifying = [(safe_bytes, "safe")]
++            oracle = "cpu-crf20-slow"
++        else:
++            for profile in ("compact", "efficient", "matched", "balanced"):
++                scores, size = results[profile]
++                if candidate_accepts(safe_scores, scores):
++                    qualifying.append((size, profile))
++            oracle = "safe-profile-fallback"
+ 
+         selected_bytes, selected = min(qualifying, key=lambda item: (item[0], item[1]))
+         ratio = selected_bytes / safe_bytes if safe_bytes > 0 else 1.0
+@@ -424,6 +525,7 @@ def calibrate(args: argparse.Namespace) -> tuple[str, float, int, bool]:
+             "plan": selected,
+             "ratio": ratio,
+             "windows": len(windows),
++            "oracle": oracle,
+         }
+         tmp = cache_file.with_suffix(".tmp")
+         tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+@@ -432,7 +534,6 @@ def calibrate(args: argparse.Namespace) -> tuple[str, float, int, bool]:
+     finally:
+         shutil.rmtree(work, ignore_errors=True)
+ 
+-
+ def build_parser() -> argparse.ArgumentParser:
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--source", required=True)
+@@ -440,6 +541,7 @@ def build_parser() -> argparse.ArgumentParser:
+     parser.add_argument("--driver-dir", required=True)
+     parser.add_argument("--quality-runtime", required=True)
+     parser.add_argument("--cache-root", required=True)
++    parser.add_argument("--software-ffmpeg", default="ffmpeg")
+     parser.add_argument("--sample-seconds", type=float, default=DEFAULT_SAMPLE_SECONDS)
+     parser.add_argument("--max-windows", type=int, default=DEFAULT_MAX_WINDOWS)
+     return parser
+diff --git a/tools/test_legacy_intel_calibration.py b/tools/test_legacy_intel_calibration.py
+index 10bb397..79b171a 100644
+--- a/tools/test_legacy_intel_calibration.py
++++ b/tools/test_legacy_intel_calibration.py
+@@ -24,6 +24,21 @@ class CalibrationPolicyTests(unittest.TestCase):
+         trial = [mod.Score(97.3, 93.6), mod.Score(94.3, 88.6)]
+         self.assertTrue(mod.candidate_accepts(safe, trial))
+ 
++    def test_cpu_match_accepts_small_controlled_loss(self):
++        cpu = [mod.Score(96.5, 91.7), mod.Score(94.0, 87.5)]
++        trial = [mod.Score(96.0, 90.9), mod.Score(93.5, 86.7)]
++        self.assertTrue(mod.candidate_matches_cpu(cpu, trial))
++
++    def test_cpu_match_rejects_excess_p10_loss(self):
++        cpu = [mod.Score(96.5, 91.7)]
++        trial = [mod.Score(96.2, 90.79)]
++        self.assertFalse(mod.candidate_matches_cpu(cpu, trial))
++
++    def test_cpu_match_does_not_force_global_floor_above_cpu_window(self):
++        cpu = [mod.Score(91.5, 86.0)]
++        trial = [mod.Score(91.0, 85.2)]
++        self.assertTrue(mod.candidate_matches_cpu(cpu, trial))
++
+     def test_mean_regression_is_rejected(self):
+         safe = [mod.Score(98.0, 95.0)]
+         trial = [mod.Score(97.19, 94.9)]
+@@ -60,9 +75,17 @@ class CalibrationPolicyTests(unittest.TestCase):
+             self.assertEqual(mod.media_duration("ffprobe", pathlib.Path("source.mov"), env=quality_env), 61.5)
+         self.assertEqual(run.call_args.kwargs["env"], quality_env)
+ 
++    def test_matched_profile_is_validated_frontier(self):
++        joined = " ".join(mod.PROFILES["matched"])
++        self.assertIn("-q:v 18", joined)
++        self.assertIn("-b_qfactor 1", joined)
++        self.assertIn("-b_qoffset 2", joined)
++        self.assertIn("-bf 15", joined)
++        self.assertIn("-refs 5", joined)
++
+     def test_profile_set_is_bounded(self):
+-        self.assertEqual(set(mod.PROFILES), {"compact", "efficient", "balanced", "safe"})
+-        self.assertLessEqual(len(mod.PROFILES), 4)
++        self.assertEqual(set(mod.PROFILES), {"compact", "efficient", "matched", "balanced", "safe"})
++        self.assertLessEqual(len(mod.PROFILES), 5)
+ 
+ 
+ if __name__ == "__main__":

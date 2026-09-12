@@ -1,0 +1,42 @@
+name: Apply CPU oracle calibration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/apply-cpu-oracle.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify base and apply validated patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "9536a1cc3155b332d485c2617cc59f4c58eac1e1"
+          git apply --check tools/cpu-oracle.patch
+          git apply tools/cpu-oracle.patch
+          test "$(sha256sum tools/legacy-intel-calibration.py | awk '{print $1}')" = "f81b7bfdd5af9ba4edce0c58baee1b7469da4445381bc92317d5c55c8333f1d8"
+          grep -F 'LEGACY_INTEL_CALIBRATOR_SHA256="f81b7bfdd5af9ba4edce0c58baee1b7469da4445381bc92317d5c55c8333f1d8"' 265Encode.sh
+          python3 tools/test_legacy_intel_calibration.py
+          python3 -m py_compile tools/legacy-intel-calibration.py tools/test_legacy_intel_calibration.py
+          rm -rf tools/__pycache__
+          bash -n 265Encode.sh
+          git diff --check
+      - name: Commit directly to main and remove temporary files
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/apply-cpu-oracle.yml tools/cpu-oracle.patch
+          git add 265Encode.sh tools/legacy-intel-calibration.py tools/test_legacy_intel_calibration.py
+          git config user.name 'andr8076'
+          git config user.email '17514629+andr8076@users.noreply.github.com'
+          git commit -m 'Match legacy Intel calibration to x265 quality'
+          git push origin HEAD:main
