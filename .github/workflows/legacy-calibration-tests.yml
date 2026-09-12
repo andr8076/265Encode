@@ -1,6 +1,7 @@
 name: Legacy Intel calibration checks
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
