@@ -1,0 +1,48 @@
+name: Finalize legacy calibration runtime fix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/finalize-legacy-calibration-runtime.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Update calibrator pin and executable bit
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sha=$(sha256sum tools/legacy-intel-calibration.py | awk '{print $1}')
+          python3 - "$sha" <<'PY'
+          import re, sys
+          from pathlib import Path
+          p=Path('265Encode.sh')
+          s=p.read_text()
+          new=sys.argv[1]
+          s,n=re.subn(r'LEGACY_INTEL_CALIBRATOR_SHA256="[0-9a-f]{64}"', f'LEGACY_INTEL_CALIBRATOR_SHA256="{new}"', s, count=1)
+          if n != 1:
+              raise SystemExit(f'expected one calibrator pin, found {n}')
+          p.write_text(s)
+          PY
+          chmod +x 265Encode.sh
+          bash -n 265Encode.sh
+          python3 -m py_compile tools/legacy-intel-calibration.py
+          python3 tools/test_legacy_intel_calibration.py
+          grep -Fq "LEGACY_INTEL_CALIBRATOR_SHA256=\"$sha\"" 265Encode.sh
+          git diff --check
+      - name: Commit fix directly to main
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add 265Encode.sh
+          git commit -m 'Finalize legacy calibration runtime fix'
+          git push origin HEAD:main
