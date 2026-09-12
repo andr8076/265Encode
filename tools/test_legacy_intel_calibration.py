@@ -24,6 +24,21 @@ class CalibrationPolicyTests(unittest.TestCase):
         trial = [mod.Score(97.3, 93.6), mod.Score(94.3, 88.6)]
         self.assertTrue(mod.candidate_accepts(safe, trial))
 
+    def test_cpu_match_accepts_small_controlled_loss(self):
+        cpu = [mod.Score(96.5, 91.7), mod.Score(94.0, 87.5)]
+        trial = [mod.Score(96.0, 90.9), mod.Score(93.5, 86.7)]
+        self.assertTrue(mod.candidate_matches_cpu(cpu, trial))
+
+    def test_cpu_match_rejects_excess_p10_loss(self):
+        cpu = [mod.Score(96.5, 91.7)]
+        trial = [mod.Score(96.2, 90.79)]
+        self.assertFalse(mod.candidate_matches_cpu(cpu, trial))
+
+    def test_cpu_match_does_not_force_global_floor_above_cpu_window(self):
+        cpu = [mod.Score(91.5, 86.0)]
+        trial = [mod.Score(91.0, 85.2)]
+        self.assertTrue(mod.candidate_matches_cpu(cpu, trial))
+
     def test_mean_regression_is_rejected(self):
         safe = [mod.Score(98.0, 95.0)]
         trial = [mod.Score(97.19, 94.9)]
@@ -60,9 +75,17 @@ class CalibrationPolicyTests(unittest.TestCase):
             self.assertEqual(mod.media_duration("ffprobe", pathlib.Path("source.mov"), env=quality_env), 61.5)
         self.assertEqual(run.call_args.kwargs["env"], quality_env)
 
+    def test_matched_profile_is_validated_frontier(self):
+        joined = " ".join(mod.PROFILES["matched"])
+        self.assertIn("-q:v 18", joined)
+        self.assertIn("-b_qfactor 1", joined)
+        self.assertIn("-b_qoffset 2", joined)
+        self.assertIn("-bf 15", joined)
+        self.assertIn("-refs 5", joined)
+
     def test_profile_set_is_bounded(self):
-        self.assertEqual(set(mod.PROFILES), {"compact", "efficient", "balanced", "safe"})
-        self.assertLessEqual(len(mod.PROFILES), 4)
+        self.assertEqual(set(mod.PROFILES), {"compact", "efficient", "matched", "balanced", "safe"})
+        self.assertLessEqual(len(mod.PROFILES), 5)
 
 
 if __name__ == "__main__":

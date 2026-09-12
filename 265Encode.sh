@@ -11,13 +11,13 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="2.8"
+SCRIPT_VERSION="2.9"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
 HARDWARE_PROBE_SIZE="256x256"
 LEGACY_INTEL_HELPER_URL="https://raw.githubusercontent.com/andr8076/265Encode/main/tools/legacy-intel.sh"
 LEGACY_INTEL_HELPER_SHA256="cc6138e22f2fe22834e99ace011d8ae1fa8a021e7f5e1cbb281596f514756c38"
 LEGACY_INTEL_CALIBRATOR_URL="https://raw.githubusercontent.com/andr8076/265Encode/main/tools/legacy-intel-calibration.py"
-LEGACY_INTEL_CALIBRATOR_SHA256="d7d0a333f55a021136ffcd7b8520cd48657528fa7e7bb3f135367b210dbaf2ea"
+LEGACY_INTEL_CALIBRATOR_SHA256="f81b7bfdd5af9ba4edce0c58baee1b7469da4445381bc92317d5c55c8333f1d8"
 LEGACY_INTEL_DEVICE_ID=""
 LEGACY_INTEL_ADDON_LOADED="no"
 LEGACY_INTEL_FFMPEG_COMMAND=()
@@ -581,6 +581,15 @@ legacy_intel_set_plan_args() {
                 -bf 15 -refs 5 -g 600
             )
             ;;
+        matched)
+            VIDEO_ENCODER_ARGS=(
+                -c:v hevc_qsv -load_plugin hevc_hw -low_power 0
+                -q:v 18
+                -b_qfactor 1 -b_qoffset 2
+                -preset:v veryslow -pix_fmt nv12
+                -bf 15 -refs 5 -g 600
+            )
+            ;;
         balanced)
             VIDEO_ENCODER_ARGS=(
                 -c:v hevc_qsv -load_plugin hevc_hw -low_power 0
@@ -653,7 +662,7 @@ configure_legacy_intel_file() {
 
     IFS='|' read -r plan ratio windows provenance <<< "$result"
     case "$plan" in
-        compact|efficient|balanced|safe) ;;
+        compact|efficient|matched|balanced|safe) ;;
         *)
             debug_log "Legacy Intel calibrator returned invalid plan: $result"
             echo "Legacy Intel tuning: invalid calibration result; using verified safe preset."
