@@ -5,6 +5,7 @@ import importlib.util
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 MODULE_PATH = pathlib.Path(__file__).with_name("legacy-intel-calibration.py")
 SPEC = importlib.util.spec_from_file_location("legacy_intel_calibration", MODULE_PATH)
@@ -47,6 +48,17 @@ class CalibrationPolicyTests(unittest.TestCase):
         self.assertIn("-g 600", joined)
         self.assertIn("-i_qfactor -0.8421052632", joined)
         self.assertIn("-b_qfactor 0.9473684211", joined)
+
+    def test_media_duration_forwards_quality_runtime_environment(self):
+        class Result:
+            returncode = 0
+            stdout = "61.5\n"
+            stderr = ""
+
+        quality_env = {"LD_LIBRARY_PATH": "/quality/lib"}
+        with mock.patch.object(mod, "_run", return_value=Result()) as run:
+            self.assertEqual(mod.media_duration("ffprobe", pathlib.Path("source.mov"), env=quality_env), 61.5)
+        self.assertEqual(run.call_args.kwargs["env"], quality_env)
 
     def test_profile_set_is_bounded(self):
         self.assertEqual(set(mod.PROFILES), {"compact", "efficient", "balanced", "safe"})
