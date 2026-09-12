@@ -144,11 +144,11 @@ def _run(command: Sequence[str], *, env: dict[str, str] | None = None) -> subpro
     )
 
 
-def media_duration(ffprobe: str, source: Path) -> float:
+def media_duration(ffprobe: str, source: Path, env: dict[str, str] | None = None) -> float:
     proc = _run([
         ffprobe, "-v", "error", "-show_entries", "format=duration",
         "-of", "default=nw=1:nk=1", str(source),
-    ])
+    ], env=env)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "ffprobe duration failed")
     value = float(proc.stdout.strip().splitlines()[0])
@@ -166,7 +166,8 @@ def _window_overlap(a: Window, b: Window) -> float:
 
 
 def packet_complexity_windows(
-    ffprobe: str, source: Path, duration: float, sample_seconds: float, limit: int
+    ffprobe: str, source: Path, duration: float, sample_seconds: float, limit: int,
+    env: dict[str, str] | None = None,
 ) -> list[Window]:
     if limit <= 0:
         return []
@@ -183,6 +184,7 @@ def packet_complexity_windows(
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=env,
         )
     except OSError:
         return []
@@ -226,6 +228,7 @@ def plan_windows(
     duration: float,
     sample_seconds: float = DEFAULT_SAMPLE_SECONDS,
     max_windows: int = DEFAULT_MAX_WINDOWS,
+    env: dict[str, str] | None = None,
 ) -> list[Window]:
     length = min(sample_seconds, duration)
     if duration <= sample_seconds * 2:
@@ -240,7 +243,7 @@ def plan_windows(
             uniform.append(candidate)
 
     complexity = packet_complexity_windows(
-        ffprobe, source, duration, sample_seconds, max(0, max_windows - len(uniform))
+        ffprobe, source, duration, sample_seconds, max(0, max_windows - len(uniform)), env=env
     )
     windows = list(uniform)
     for candidate in complexity:
@@ -373,18 +376,18 @@ def calibrate(args: argparse.Namespace) -> tuple[str, float, int, bool]:
     legacy_ffmpeg = legacy_runtime / "bin" / "ffmpeg"
     quality_ffmpeg = quality_runtime / "bin" / "ffmpeg"
     quality_ffprobe = quality_runtime / "bin" / "ffprobe"
-    duration = media_duration(str(quality_ffprobe), source)
+    quality_env = build_quality_env(quality_runtime)
+    duration = media_duration(str(quality_ffprobe), source, env=quality_env)
     if duration < 12.0:
         return "safe", 1.0, 0, False
 
     windows = plan_windows(
-        str(quality_ffprobe), source, duration, args.sample_seconds, args.max_windows
+        str(quality_ffprobe), source, duration, args.sample_seconds, args.max_windows, env=quality_env
     )
     if not windows:
         return "safe", 1.0, 0, False
 
     legacy_env = build_legacy_env(legacy_runtime, driver_dir)
-    quality_env = build_quality_env(quality_runtime)
     results: dict[str, tuple[list[Score], int]] = {}
 
     work = Path(tempfile.mkdtemp(prefix="265encode-legacy-calibration.", dir=str(cache_root)))
