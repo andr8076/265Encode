@@ -24,7 +24,7 @@
     "hardware_policy": {"enum": ["auto_hardware_only", "manual_software"]},
     "requested_encoder": {
       "type": ["string", "null"],
-      "enum": [null, "hevc_vaapi", "hevc_nvenc", "hevc_qsv", "hevc_videotoolbox", "libx265"]
+      "enum": [null, "hevc_vaapi", "hevc_nvenc", "hevc_qsv", "hevc_qsv_legacy", "hevc_videotoolbox", "libx265"]
     },
     "quality": {
       "type": "object",

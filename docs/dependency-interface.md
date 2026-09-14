@@ -124,13 +124,16 @@ list. It reports these protocol-2 encoder identifiers:
 - `hevc_vaapi`
 - `hevc_nvenc`
 - `hevc_qsv`
+- `hevc_qsv_legacy` (isolated Intel Media SDK compatibility runtime)
 - `hevc_videotoolbox`
 - `libx265` (manual software only)
 
 `auto_encoder` is either a proven hardware encoder or `null`. Software is
-never AUTO-eligible. The standalone Intel Skylake compatibility path remains
-owned by 265Encode, but `legacy_intel_protocol2` is currently `false`; callers
-must not assume that legacy execution can be represented by a sealed plan yet.
+never AUTO-eligible. On supported Skylake/P530 systems, the legacy backend is
+automatically capability-probed and may be selected as `auto_encoder` after
+modern hardware paths fail. Its runtime, driver, and tuned recipe are sealed
+and fingerprinted by 265Encode. Callers must not download that runtime, choose
+legacy presets, or branch on the backend name.
 
 ## Execution guarantees
 
@@ -141,6 +144,11 @@ atomically only after validation. Before committing, 265Encode verifies:
 - duration remains within the bounded tolerance;
 - primary video and every audio stream decode successfully;
 - video, audio, subtitle, data, and attachment stream counts match the source.
+
+For the legacy Intel backend, the isolated compatibility runtime encodes only
+the primary video. The host FFmpeg then performs the final stream-preserving
+mux and any requested Opus audio optimization without re-encoding that video.
+Both runtimes are included in the sealed runtime fingerprint.
 
 The atomic result uses the `encode265.plan-result` schema and includes the
 opaque plan ID, prediction, selected encoder, output path, and executor result.

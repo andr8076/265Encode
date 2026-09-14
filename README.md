@@ -34,11 +34,14 @@ Modern backends are tested with bounded real encodes:
 - AMD/Mesa VA-API: `hevc_vaapi`
 - NVIDIA NVENC: `hevc_nvenc`
 - Intel Quick Sync: `hevc_qsv`
+- Intel Skylake/P530 compatibility: `hevc_qsv_legacy`
 - Apple VideoToolbox: `hevc_videotoolbox`
 
-`libx265` is software and manual-only. Intel Skylake/P530 compatibility remains
-an optional, capability-gated standalone path using the isolated legacy runtime.
-It is not yet eligible for protocol-2 sealed plans.
+`libx265` is software and manual-only. On supported Skylake/P530 systems,
+265Encode automatically provisions and verifies its isolated legacy runtime,
+then performs content-aware quality calibration. This selection is identical
+for standalone and protocol-2 callers; Hardcore Archive does not need legacy
+Intel settings or special-case logic.
 
 ## Dependency interface
 
@@ -60,8 +63,8 @@ codec, duration, stream-count, and full video/audio decode validation.
 
 The interface supports:
 
-- hardware-only AUTO and explicit manual `libx265`;
-- explicit backend requests;
+- hardware-only AUTO, including transparent legacy Intel selection, and explicit manual `libx265`;
+- explicit backend requests for diagnostics or operator overrides;
 - required VMAF/SSIM quality or caller-disabled quality checks;
 - maximum-height scaling and optional denoise;
 - all-stream, chapter, attachment, and metadata preservation;

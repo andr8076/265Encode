@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# 265Encode 3.0.0.
+# 265Encode 3.1.0.
 # Hardware HEVC encoding is capability-proven and hardware-only in AUTO.
 # Protocol 2 exposes semantic requirements, sealed plans, fingerprints,
 # predictions, preservation, and validated atomic execution to dependent tools.
@@ -9,7 +9,7 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.1.0"
 LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
 HARDWARE_PROBE_SIZE="256x256"
@@ -927,6 +927,17 @@ machine_probe_encoder() {
                 MACHINE_PROBE_DETAIL="Intel Quick Sync"
             fi
             ;;
+        hevc_qsv_legacy)
+            if legacy_intel_host_present; then
+                MACHINE_PROBE_ADVERTISED=true
+                if try_legacy_intel_hw; then
+                    MACHINE_PROBE_USABLE=true
+                    MACHINE_PROBE_DETAIL="Intel Skylake legacy Media SDK HEVC (${LEGACY_INTEL_DEVICE_ID})"
+                else
+                    MACHINE_PROBE_DETAIL="${ENCODE265_LEGACY_ERROR:-legacy Intel capability probe failed}"
+                fi
+            fi
+            ;;
         hevc_videotoolbox)
             if [[ "$MACHINE_PROBE_ADVERTISED" == true ]] &&
                test_simple_encoder hevc_videotoolbox yuv420p10le; then
@@ -946,10 +957,18 @@ machine_probe_encoder() {
 
 machine_encoder_json() {
     local name="$1" class="$2" advertised="$3" usable="$4" detail="$5"
-    printf '{"name":%s,"class":%s,"auto_eligible":%s,"advertised":%s,"usable":%s,"detail":%s}' \
+    printf '{"name":%s,"class":%s,"auto_eligible":%s,"advertised":%s,"usable":%s,"detail":%s' \
         "$(json_string "$name")" "$(json_string "$class")" \
         "$([[ $class == hardware ]] && printf true || printf false)" \
         "$advertised" "$usable" "$(json_string "$detail")"
+    if [[ $name == hevc_qsv_legacy && $usable == true ]]; then
+        printf ',"runtime":{"ffmpeg":%s,"ffprobe":%s,"manifest":%s,"driver_dir":%s}' \
+            "$(json_string "${ENCODE265_LEGACY_RUNTIME}/bin/ffmpeg")" \
+            "$(json_string "${ENCODE265_LEGACY_RUNTIME}/bin/ffprobe")" \
+            "$(json_string "${ENCODE265_LEGACY_RUNTIME}/runtime-manifest.txt")" \
+            "$(json_string "${ENCODE265_LEGACY_DRIVER_DIR}")"
+    fi
+    printf '}'
 }
 
 show_machine_capabilities() {
@@ -957,7 +976,7 @@ show_machine_capabilities() {
     local -a records=()
 
     ffmpeg_version=$(ffmpeg -hide_banner -version 2>/dev/null | head -n 1)
-    for encoder in hevc_vaapi hevc_nvenc hevc_videotoolbox hevc_qsv libx265; do
+    for encoder in hevc_vaapi hevc_nvenc hevc_videotoolbox hevc_qsv hevc_qsv_legacy libx265; do
         machine_probe_encoder "$encoder"
         class=hardware
         [[ $encoder == libx265 ]] && class=software
@@ -972,7 +991,7 @@ show_machine_capabilities() {
     printf '"tool":{"name":"265Encode","version":%s},' "$(json_string "$SCRIPT_VERSION")"
     printf '"supported_protocol_versions":[2],'
     printf '"codec":"hevc","auto_policy":"hardware_only","ffmpeg":%s,' "$(json_string "$ffmpeg_version")"
-    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true,"semantic_planning":true,"opaque_plan_id":true,"fingerprint_invalidation":true,"sampled_predictions":true,"semantic_requested_encoder":true,"semantic_quality_off":true,"semantic_scaling":true,"semantic_denoise":true,"semantic_audio_optimize":true,"legacy_intel_protocol2":false},'
+    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true,"semantic_planning":true,"opaque_plan_id":true,"fingerprint_invalidation":true,"sampled_predictions":true,"semantic_requested_encoder":true,"semantic_quality_off":true,"semantic_scaling":true,"semantic_denoise":true,"semantic_audio_optimize":true,"legacy_intel_protocol2":true,"legacy_intel_auto_transparent":true},'
     if [[ -n $auto_encoder ]]; then
         printf '"auto_encoder":%s,' "$(json_string "$auto_encoder")"
     else

@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from hevcplan_contract import PlanError, planning_quality_target
+from hevcplan_contract import PlanError, encoder_runtime, planning_quality_target
 
 
 def software_filter(recipe: dict[str, Any]) -> str:
@@ -37,6 +37,16 @@ def video_encode_args(encoder: str, recipe: dict[str, Any], sample: bool = False
     elif encoder == "hevc_qsv":
         if filt: output_args += [f"-vf:v{stream}", filt]
         output_args += [f"-c:v{stream}", encoder, f"-global_quality:v{stream}", str(quality["value"]), f"-preset:v{stream}", "slow", f"-pix_fmt:v{stream}", "yuv420p10le"]
+    elif encoder == "hevc_qsv_legacy":
+        if filt: output_args += [f"-vf:v{stream}", filt]
+        output_args += [
+            f"-c:v{stream}", "hevc_qsv", "-load_plugin", "hevc_hw",
+            "-low_power", "0", f"-q:v{stream}", str(quality["value"]),
+            f"-preset:v{stream}", "veryslow", f"-pix_fmt:v{stream}", "nv12",
+            f"-i_qfactor:v{stream}", "-0.8421052632", f"-i_qoffset:v{stream}", "0",
+            f"-b_qfactor:v{stream}", "0.9473684211", f"-b_qoffset:v{stream}", "0",
+            f"-bf:v{stream}", "6", f"-refs:v{stream}", "4", f"-g:v{stream}", "600",
+        ]
     elif encoder == "hevc_videotoolbox":
         if filt: output_args += [f"-vf:v{stream}", filt]
         actual_quality = 100 - int(quality["value"])
@@ -51,8 +61,9 @@ def video_encode_args(encoder: str, recipe: dict[str, Any], sample: bool = False
 
 def encode_sample(source: Path, destination: Path, encoder: str, recipe: dict[str, Any], start: float, length: float) -> float:
     global_args, video_args = video_encode_args(encoder, recipe, sample=True)
-    args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *global_args, "-ss", f"{start:.6f}", "-t", f"{length:.6f}", "-i", str(source), "-map", "0:V:0", "-an", "-sn", "-dn", *video_args, "-f", "matroska", str(destination)]
-    before = time.monotonic(); result = subprocess.run(args, text=True, capture_output=True, check=False); elapsed = time.monotonic() - before
+    ffmpeg, environment = encoder_runtime(recipe)
+    args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", *global_args, "-ss", f"{start:.6f}", "-t", f"{length:.6f}", "-i", str(source), "-map", "0:V:0", "-an", "-sn", "-dn", *video_args, "-f", "matroska", str(destination)]
+    before = time.monotonic(); result = subprocess.run(args, env=environment, text=True, capture_output=True, check=False); elapsed = time.monotonic() - before
     if result.returncode != 0 or not destination.is_file() or destination.stat().st_size <= 0: raise PlanError(result.stderr.strip() or "Sample encoding failed.")
     return max(elapsed, .001)
 

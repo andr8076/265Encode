@@ -172,10 +172,63 @@ assert 'source fingerprint changed' in result['error']
 PY
 
 PYTHONPATH="$ROOT/tools" python3 - <<'PY'
-from hevcplan_contract import choose_encoder
+import tempfile
+from pathlib import Path
+from unittest import mock
+import hevcplan_execute as executor
+from hevcplan_contract import choose_encoder, encoder_runtime, runtime_fingerprint
+from hevcplan_quality import video_encode_args
 req={'hardware_policy':'auto_hardware_only','requested_encoder':'hevc_nvenc'}
 report={'auto_encoder':'hevc_qsv','encoders':[{'name':'hevc_nvenc','usable':True,'class':'hardware'},{'name':'hevc_qsv','usable':True,'class':'hardware'}]}
 assert choose_encoder(req, report)[:2] == ('hevc_nvenc','hardware')
+req={'hardware_policy':'auto_hardware_only','requested_encoder':None}
+legacy={'name':'hevc_qsv_legacy','usable':True,'class':'hardware'}
+report={'auto_encoder':'hevc_qsv_legacy','encoders':[legacy]}
+assert choose_encoder(req, report) == ('hevc_qsv_legacy','hardware',legacy)
+recipe={
+    'encoder':'hevc_qsv_legacy',
+    'quality':{'kind':'qp','value':19,'preset':'legacy-safe-v1'},
+    'resolution':{'mode':'source','width':640,'height':360},
+    'denoise':{'mode':'none','filter':None},
+}
+global_args,video_args=video_encode_args('hevc_qsv_legacy',recipe)
+assert global_args == []
+assert video_args[:6] == ['-c:v:0','hevc_qsv','-load_plugin','hevc_hw','-low_power','0']
+assert '-q:v:0' in video_args and video_args[video_args.index('-q:v:0')+1] == '19'
+assert '-i_qfactor:v:0' in video_args and '-b_qfactor:v:0' in video_args
+assert video_args[video_args.index('-pix_fmt:v:0')+1] == 'nv12'
+with tempfile.TemporaryDirectory() as raw:
+    root=Path(raw); (root/'bin').mkdir(); (root/'lib/dri').mkdir(parents=True)
+    for name in ('ffmpeg','ffprobe'):
+        tool=root/'bin'/name
+        tool.write_text('#!/bin/sh\nprintf "legacy-test-runtime\n"\n',encoding='utf-8')
+        tool.chmod(0o755)
+    (root/'runtime-manifest.txt').write_text('runtime_kind=intel-media-sdk-legacy\n',encoding='utf-8')
+    (root/'lib/dri/iHD_drv_video.so').write_text('driver',encoding='utf-8')
+    recipe['runtime']={'ffmpeg':str(root/'bin/ffmpeg'),'ffprobe':str(root/'bin/ffprobe'),'manifest':str(root/'runtime-manifest.txt'),'driver_dir':str(root/'lib/dri')}
+    executable,environment=encoder_runtime(recipe)
+    assert executable == str(root/'bin/ffmpeg')
+    assert environment['INTEL_MEDIA_RUNTIME'] == 'MSDK'
+    assert environment['LIBVA_DRIVER_NAME'] == 'iHD'
+    fingerprint=runtime_fingerprint('hevc_qsv_legacy',recipe)
+    assert fingerprint['components']['runtime_manifest'].startswith('sha256:')
+    assert fingerprint['components']['driver'].startswith('sha256:')
+    recipe['audio']={'tracks':[{'output_audio_index':0,'mode':'opus','bitrate':128000}]}
+    requirements={'input':str(root/'source.mkv'),'output':str(root/'output.mkv')}
+    (root/'source.mkv').write_text('source',encoding='utf-8')
+    source={'primary_stream_index':0,'streams':[{'index':0},{'index':1}]}
+    commands=[]
+    def fake_run(command,**kwargs):
+        commands.append(command); Path(command[-1]).write_text('encoded',encoding='utf-8')
+        return type('Result',(),{'returncode':0,'stderr':''})()
+    def fake_runtime(value,tool='ffmpeg'):
+        return ('/legacy/ffmpeg' if value.get('encoder')=='hevc_qsv_legacy' else '/host/ffmpeg'),{}
+    with mock.patch.object(executor,'encoder_runtime',side_effect=fake_runtime), mock.patch.object(executor.subprocess,'run',side_effect=fake_run), mock.patch.object(executor,'validate_output'):
+        executor.execute_direct(requirements,recipe,source)
+    assert len(commands)==2 and '-an' in commands[0]
+    assert commands[1][0]=='/host/ffmpeg' and 'libopus' in commands[1]
+    assert commands[1][commands[1].index('-map')+1]=='0:v:0'
+    assert '1:1' in commands[1]
 PY
 
 printf 'Extended protocol-v2 semantic ownership tests passed.\n'
