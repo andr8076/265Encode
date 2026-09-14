@@ -133,7 +133,9 @@ never AUTO-eligible. On supported Skylake/P530 systems, the legacy backend is
 automatically capability-probed and may be selected as `auto_encoder` after
 modern hardware paths fail. Its runtime, driver, and tuned recipe are sealed
 and fingerprinted by 265Encode. Callers must not download that runtime, choose
-legacy presets, or branch on the backend name.
+legacy presets, denoiser implementations, or branch on the backend name. Legacy
+Intel uses the mutually supported `atadenoise` filter when denoising is required;
+modern and software backends retain the tuned `hqdn3d` policy.
 
 ## Execution guarantees
 

@@ -12,7 +12,7 @@ python3 -m py_compile \
     "$ROOT/tools/hevcplan_execute.py" \
     "$ROOT/tools/legacy-intel-calibration.py"
 
-[[ $("$ROOT/265Encode.sh" --version) == "265Encode.sh 3.1.0" ]]
+[[ $("$ROOT/265Encode.sh" --version) == "265Encode.sh 3.1.1" ]]
 [[ $("$ROOT/265Encode.sh" --interface-version) == 2 ]]
 "$ROOT/265Encode.sh" --machine-negotiate 1 |
     python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["compatible"] is False'
