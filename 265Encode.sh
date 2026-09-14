@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 
-# Build 2.7: make legacy Intel support fully owned and served by 265Encode.
-# The VA-API filter chain now normalizes every frame to the input stream's initial
-# dimensions before it reaches the encoder, preventing an incompatible software
-# auto-scaler from being inserted after hwupload.
-# H.265 batch encoder with both interactive and command-line operation.
-# On Linux/AMD, input decoding stays on the CPU and decoded frames are
-# uploaded to the GPU for HEVC encoding through VA-API.
+# 265Encode 3.0.0.
+# Hardware HEVC encoding is capability-proven and hardware-only in AUTO.
+# Protocol 2 exposes semantic requirements, sealed plans, fingerprints,
+# predictions, preservation, and validated atomic execution to dependent tools.
+# The interactive and command-line batch encoder remains independently usable.
 
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="2.9"
+SCRIPT_VERSION="3.0.0"
+LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
 HARDWARE_PROBE_SIZE="256x256"
 LEGACY_INTEL_HELPER_URL="https://raw.githubusercontent.com/andr8076/265Encode/main/tools/legacy-intel.sh"
@@ -58,7 +57,9 @@ Usage:
   $SCRIPT_NAME [options] FILE_OR_FOLDER
   $SCRIPT_NAME [options] --input FILE_OR_FOLDER
 
-With no arguments, the script uses the original interactive menus.
+With no arguments, the script uses the original interactive menus and selects
+only a capability-proven hardware HEVC encoder. Software encoding always
+requires an explicit --software request.
 With command-line arguments, it runs non-interactively unless --interactive
 or --confirm is supplied.
 
@@ -73,8 +74,8 @@ Input and traversal:
 
 Encoding:
   -m, --mode MODE          auto, software, or hardware
-      --auto               Use hardware when available, otherwise software
-      --software           Force libx265 software encoding
+      --auto               Automatically select a working hardware encoder
+      --software           Explicitly allow libx265 CPU encoding
       --hardware           Require hardware HEVC encoding
       --crf NUMBER         libx265 CRF, default: 20
       --preset NAME        libx265 preset, default: slow
@@ -102,11 +103,22 @@ Operation:
       --no-legacy-calibration
                            Use the verified safe P530 preset without sampling
       --no-legacy-intel    Disable optional legacy Intel fallback for this run
+
+Dependency interface:
+      --machine-probe      Print versioned encoder capability JSON and exit
+      --interface-version Print the newest machine-interface version and exit
+      --machine-negotiate VERSIONS
+                           Select the newest supported version
+      --machine-evaluate REQUIREMENTS.json --plan-json PLAN.json
+      --machine-plan REQUIREMENTS.json --plan-json PLAN.json
+                           Evaluate protocol-2 requirements and seal a plan
+      --execute-plan PLAN.json --result-json RESULT.json
+                           Revalidate fingerprints and execute the sealed plan
   -h, --help               Show this help
       --version            Show the script version
 
 Command-line defaults:
-  mode=auto, recursive=no, common extensions, process HEVC, AAC 192k,
+  mode=auto (hardware only), recursive=no, common extensions, process HEVC, AAC 192k,
   container=mp4, and skip existing output files.
 
 Examples:
@@ -724,26 +736,48 @@ encoder_available() {
     return 1
 }
 
+validate_hardware_probe_output() {
+    local output="$1" codec
+    codec=$(ffprobe -v error -select_streams V:0 -show_entries stream=codec_name \
+        -of csv=p=0 "$output" 2>/dev/null | head -n1)
+    [[ $codec == hevc ]] || {
+        debug_log "Probe output codec was ${codec:-unreadable}, not HEVC."
+        return 1
+    }
+    ffmpeg -hide_banner -loglevel error -xerror -nostdin -i "$output" \
+        -map '0:V:0' -f null - >/dev/null 2>&1 || {
+        debug_log "Probe output failed decode validation."
+        return 1
+    }
+}
+
 test_simple_encoder() {
-    local encoder="$1"
-    local pixel_format="$2"
+    local encoder="$1" pixel_format="$2" work output status=1
+    work=$(mktemp -d "${TMPDIR:-/tmp}/265encode-probe.XXXXXX") || return 1
+    output="$work/probe.mkv"
     local command=(
-        ffmpeg -hide_banner -loglevel error
+        ffmpeg -hide_banner -loglevel error -y
         -f lavfi -i "color=black:size=${HARDWARE_PROBE_SIZE}:rate=1"
         -frames:v 1
         -c:v "$encoder"
         -pix_fmt "$pixel_format"
-        -f null -
+        "$output"
     )
 
-    run_hardware_probe "Testing $encoder with $pixel_format" "${command[@]}"
+    if run_hardware_probe "Testing $encoder with $pixel_format" "${command[@]}" &&
+       validate_hardware_probe_output "$output"; then
+        status=0
+    fi
+    rm -rf -- "$work"
+    return "$status"
 }
 
 test_vaapi_device() {
-    local device="$1"
-    local upload_format="$2"
+    local device="$1" upload_format="$2" work output status=1
+    work=$(mktemp -d "${TMPDIR:-/tmp}/265encode-probe.XXXXXX") || return 1
+    output="$work/probe.mkv"
     local command=(
-        ffmpeg -hide_banner -loglevel error
+        ffmpeg -hide_banner -loglevel error -y
         -init_hw_device "vaapi=va:${device}"
         -filter_hw_device va
         -f lavfi -i "color=black:size=${HARDWARE_PROBE_SIZE}:rate=1"
@@ -751,15 +785,19 @@ test_vaapi_device() {
         -vf "format=${upload_format},hwupload,scale_vaapi=w=${HARDWARE_PROBE_SIZE%x*}:h=${HARDWARE_PROBE_SIZE#*x}:format=${upload_format}:mode=hq"
         -c:v hevc_vaapi
         -qp 30
-        -f null -
+        "$output"
     )
 
     # Do not force Main or Main10 here. The VA-API encoder chooses the profile
     # from nv12 or p010le. Forcing a profile can create false probe failures on
     # otherwise working Mesa/VA-API combinations.
-    run_hardware_probe \
+    if run_hardware_probe \
         "Testing VA-API device $device with upload format $upload_format" \
-        "${command[@]}"
+        "${command[@]}" && validate_hardware_probe_output "$output"; then
+        status=0
+    fi
+    rm -rf -- "$work"
+    return "$status"
 }
 
 show_vaapi_environment() {
@@ -846,6 +884,107 @@ configure_vaapi() {
 
     debug_log "All VA-API HEVC probes failed."
     return 1
+}
+
+json_string() {
+    local value="${1-}"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+    printf '"%s"' "$value"
+}
+
+machine_probe_encoder() {
+    local encoder="$1"
+    MACHINE_PROBE_ADVERTISED=false
+    MACHINE_PROBE_USABLE=false
+    MACHINE_PROBE_DETAIL=""
+
+    if encoder_available "$encoder"; then
+        MACHINE_PROBE_ADVERTISED=true
+    fi
+
+    case "$encoder" in
+        hevc_vaapi)
+            if configure_vaapi; then
+                MACHINE_PROBE_USABLE=true
+                MACHINE_PROBE_DETAIL="${VAAPI_DEVICE}, ${VAAPI_BIT_DEPTH}"
+            fi
+            ;;
+        hevc_nvenc)
+            if [[ "$MACHINE_PROBE_ADVERTISED" == true ]] &&
+               test_simple_encoder hevc_nvenc p010le; then
+                MACHINE_PROBE_USABLE=true
+                MACHINE_PROBE_DETAIL="NVIDIA NVENC"
+            fi
+            ;;
+        hevc_qsv)
+            if [[ "$MACHINE_PROBE_ADVERTISED" == true ]] &&
+               test_simple_encoder hevc_qsv p010le; then
+                MACHINE_PROBE_USABLE=true
+                MACHINE_PROBE_DETAIL="Intel Quick Sync"
+            fi
+            ;;
+        hevc_videotoolbox)
+            if [[ "$MACHINE_PROBE_ADVERTISED" == true ]] &&
+               test_simple_encoder hevc_videotoolbox yuv420p10le; then
+                MACHINE_PROBE_USABLE=true
+                MACHINE_PROBE_DETAIL="Apple VideoToolbox"
+            fi
+            ;;
+        libx265)
+            if [[ "$MACHINE_PROBE_ADVERTISED" == true ]] &&
+               test_simple_encoder libx265 yuv420p10le; then
+                MACHINE_PROBE_USABLE=true
+                MACHINE_PROBE_DETAIL="x265 software encoder"
+            fi
+            ;;
+    esac
+}
+
+machine_encoder_json() {
+    local name="$1" class="$2" advertised="$3" usable="$4" detail="$5"
+    printf '{"name":%s,"class":%s,"auto_eligible":%s,"advertised":%s,"usable":%s,"detail":%s}' \
+        "$(json_string "$name")" "$(json_string "$class")" \
+        "$([[ $class == hardware ]] && printf true || printf false)" \
+        "$advertised" "$usable" "$(json_string "$detail")"
+}
+
+show_machine_capabilities() {
+    local ffmpeg_version auto_encoder="" first=true encoder class record
+    local -a records=()
+
+    ffmpeg_version=$(ffmpeg -hide_banner -version 2>/dev/null | head -n 1)
+    for encoder in hevc_vaapi hevc_nvenc hevc_videotoolbox hevc_qsv libx265; do
+        machine_probe_encoder "$encoder"
+        class=hardware
+        [[ $encoder == libx265 ]] && class=software
+        records+=("$(machine_encoder_json "$encoder" "$class" "$MACHINE_PROBE_ADVERTISED" \
+            "$MACHINE_PROBE_USABLE" "$MACHINE_PROBE_DETAIL")")
+        if [[ -z $auto_encoder && $class == hardware && $MACHINE_PROBE_USABLE == true ]]; then
+            auto_encoder=$encoder
+        fi
+    done
+
+    printf '{"schema":"encode265.capabilities","protocol_version":2,'
+    printf '"tool":{"name":"265Encode","version":%s},' "$(json_string "$SCRIPT_VERSION")"
+    printf '"supported_protocol_versions":[2],'
+    printf '"codec":"hevc","auto_policy":"hardware_only","ffmpeg":%s,' "$(json_string "$ffmpeg_version")"
+    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true,"semantic_planning":true,"opaque_plan_id":true,"fingerprint_invalidation":true,"sampled_predictions":true,"semantic_requested_encoder":true,"semantic_quality_off":true,"semantic_scaling":true,"semantic_denoise":true,"semantic_audio_optimize":true,"legacy_intel_protocol2":false},'
+    if [[ -n $auto_encoder ]]; then
+        printf '"auto_encoder":%s,' "$(json_string "$auto_encoder")"
+    else
+        printf '"auto_encoder":null,'
+    fi
+    printf '"encoders":['
+    for record in "${records[@]}"; do
+        [[ $first == true ]] || printf ','
+        first=false
+        printf '%s' "$record"
+    done
+    printf ']}\n'
 }
 
 detect_hw() {
@@ -978,31 +1117,25 @@ collect_interactive_options() {
     if [[ -z "$MODE" ]]; then
         echo
         echo "--- Encoding Mode ---"
-        echo "1) Quality/Small Size - Software libx265"
-
         case "$HW_TYPE" in
-            nvidia) echo "2) High Speed - NVIDIA NVENC" ;;
-            apple)  echo "2) High Speed - Apple VideoToolbox" ;;
-            intel)  echo "2) High Speed - Intel QSV" ;;
-            intel-legacy) echo "2) High Speed - Intel Skylake Legacy QSV" ;;
+            nvidia) echo "1) AUTO hardware - NVIDIA NVENC" ;;
+            apple)  echo "1) AUTO hardware - Apple VideoToolbox" ;;
+            intel)  echo "1) AUTO hardware - Intel QSV" ;;
+            intel-legacy) echo "1) AUTO hardware - Intel Skylake Legacy QSV" ;;
             vaapi)
-                echo "2) High Speed - AMD/Linux VA-API"
+                echo "1) AUTO hardware - AMD/Linux VA-API"
                 echo "   Device: $VAAPI_DEVICE"
                 echo "   Mode:   ${VAAPI_BIT_DEPTH} HEVC"
                 ;;
-            *) echo "2) Hardware acceleration not detected" ;;
+            *) echo "1) AUTO hardware - unavailable on this machine" ;;
         esac
+        echo "2) Manual software - libx265"
 
-        read -r -p "Select mode (1 or 2): " mode_choice
+        read -r -p "Select mode [1]: " mode_choice
         if [[ "$mode_choice" == "2" ]]; then
-            if [[ "$HW_TYPE" == "none" ]]; then
-                echo "Hardware encoding is unavailable; using software libx265 instead."
-                MODE="software"
-            else
-                MODE="hardware"
-            fi
-        else
             MODE="software"
+        else
+            MODE="auto"
         fi
     fi
 
@@ -1060,16 +1193,12 @@ configure_encoder() {
     detect_hw
 
     if [[ "$selected_mode" == "auto" ]]; then
-        if [[ "$HW_TYPE" == "none" ]]; then
-            selected_mode="software"
-        else
-            selected_mode="hardware"
-        fi
+        selected_mode="hardware"
     fi
 
     if [[ "$selected_mode" == "hardware" && "$HW_TYPE" == "none" ]]; then
-        error "Hardware mode was requested, but no working HEVC hardware encoder was detected."
-        echo "Use --auto to fall back automatically or --software to force libx265." >&2
+        error "No capability-proven HEVC hardware encoder is available."
+        echo "AUTO never selects CPU encoding; use --software to explicitly allow libx265." >&2
         exit 1
     fi
 
@@ -1234,6 +1363,39 @@ print_command() {
     printf '\n'
 }
 
+validate_completed_output() {
+    local source="$1" candidate="$2" codec source_duration output_duration
+
+    [[ -s $candidate ]] || {
+        error "Encoding produced no output file."
+        return 1
+    }
+    codec=$(ffprobe -v error -select_streams V:0 -show_entries stream=codec_name \
+        -of csv=p=0 "$candidate" 2>/dev/null | head -n1)
+    [[ $codec == hevc ]] || {
+        error "Completed output codec was ${codec:-unreadable}, not HEVC."
+        return 1
+    }
+
+    source_duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 \
+        "$source" 2>/dev/null | head -n1)
+    output_duration=$(ffprobe -v error -show_entries format=duration -of csv=p=0 \
+        "$candidate" 2>/dev/null | head -n1)
+    if [[ $source_duration =~ ^[0-9]+([.][0-9]+)?$ &&
+          $output_duration =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+       ! awk -v source="$source_duration" -v output="$output_duration" \
+           'BEGIN {delta=source-output; if(delta<0)delta=-delta; exit !(delta<=2)}'; then
+        error "Completed output duration differs from the input by more than two seconds."
+        return 1
+    fi
+
+    ffmpeg -hide_banner -loglevel error -xerror -nostdin -i "$candidate" \
+        -map '0:V:0' -map '0:a?' -f null - >/dev/null 2>&1 || {
+        error "Completed output failed full video/audio decode validation."
+        return 1
+    }
+}
+
 encode_file() {
     local input_file="$1"
     local output_file="${input_file%.*}_h265.${OUTPUT_EXTENSION}"
@@ -1318,8 +1480,9 @@ encode_file() {
     ffmpeg_status=$?
 
     if [[ $ffmpeg_status -eq 0 ]]; then
-        if [[ ! -s "$temporary_output" ]]; then
-            error "FFmpeg reported success, but no output file was created."
+        if ! validate_completed_output "$input_file" "$temporary_output"; then
+            rm -f -- "$temporary_output"
+            error "Completed output was rejected and removed; the input is unchanged."
             return 1
         fi
 
@@ -1415,10 +1578,64 @@ show_plan() {
     done
 }
 
+dispatch_dependency_interface() {
+    local script_dir planner
+    script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+    planner="$script_dir/tools/HEVCPlan.py"
+
+    case "${1-}" in
+        --interface-version)
+            (( $# == 1 )) || { error "Usage: $SCRIPT_NAME --interface-version"; exit 2; }
+            printf '%s\n' "$LATEST_MACHINE_INTERFACE_VERSION"
+            exit 0
+            ;;
+        --machine-probe)
+            (( $# == 1 )) || { error "Usage: $SCRIPT_NAME --machine-probe"; exit 2; }
+            check_dependencies
+            show_machine_capabilities
+            exit 0
+            ;;
+        --machine-negotiate)
+            (( $# == 2 )) || {
+                error "Usage: $SCRIPT_NAME --machine-negotiate VERSION[,VERSION...]"
+                exit 2
+            }
+            command -v python3 >/dev/null 2>&1 || {
+                error "python3 is required for protocol 2."
+                exit 1
+            }
+            exec python3 "$planner" negotiate "$2"
+            ;;
+        --machine-evaluate|--machine-plan)
+            (( $# == 4 )) && [[ "$3" == --plan-json ]] || {
+                error "Usage: $SCRIPT_NAME $1 REQUIREMENTS.json --plan-json PLAN.json"
+                exit 2
+            }
+            command -v python3 >/dev/null 2>&1 || {
+                error "python3 is required for protocol 2."
+                exit 1
+            }
+            exec python3 "$planner" evaluate "$2" "$4" "$script_dir/265Encode.sh"
+            ;;
+        --execute-plan)
+            (( $# == 4 )) && [[ "$3" == --result-json ]] || {
+                error "Usage: $SCRIPT_NAME --execute-plan PLAN.json --result-json RESULT.json"
+                exit 2
+            }
+            command -v python3 >/dev/null 2>&1 || {
+                error "python3 is required for protocol 2."
+                exit 1
+            }
+            exec python3 "$planner" execute "$2" "$4" "$script_dir/265Encode.sh"
+            ;;
+    esac
+}
+
 main() {
     local file
     local failures=0
 
+    dispatch_dependency_interface "$@"
     parse_arguments "$@"
     validate_options
     check_dependencies
