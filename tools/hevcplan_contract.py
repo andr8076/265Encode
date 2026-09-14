@@ -19,6 +19,7 @@ RESULT_SCHEMA = "encode265.plan-result"
 PLANNER_VERSION = "5"
 VMAF_PLANNING_MARGIN = 0.5
 DENOISE_FILTER = "hqdn3d=1.2:1.0:3.0:2.5"
+LEGACY_DENOISE_FILTER = "atadenoise"
 SUPPORTED_ENCODERS = {
     "hevc_vaapi", "hevc_nvenc", "hevc_qsv", "hevc_qsv_legacy",
     "hevc_videotoolbox", "libx265",
@@ -362,6 +363,13 @@ def _legacy_runtime(capability: dict[str, Any]) -> dict[str, str]:
     return result
 
 
+def _legacy_filter_available(runtime: dict[str, str], name: str) -> bool:
+    recipe = {"encoder": "hevc_qsv_legacy", "runtime": runtime}
+    ffmpeg, environment = encoder_runtime(recipe)
+    result = subprocess.run([ffmpeg, "-hide_banner", "-filters"], env=environment, text=True, capture_output=True, check=False)
+    return result.returncode == 0 and any(line.split()[1:2] == [name] for line in result.stdout.splitlines())
+
+
 def recipe_for(encoder: str, requirements: dict[str, Any], source: dict[str, Any], capability: dict[str, Any]) -> dict[str, Any]:
     if encoder == "libx265":
         quality = {"kind": "crf", "value": 20, "preset": "slow"}
@@ -377,17 +385,23 @@ def recipe_for(encoder: str, requirements: dict[str, Any], source: dict[str, Any
     target_height = source["height"] if maximum is None else min(source["height"], maximum)
     target_width = source["width"] if target_height == source["height"] else max(2, int(round((source["width"] * target_height / source["height"]) / 2.0) * 2))
     denoise_mode = requirements["video"]["denoise"]
-    hqdn3d = _listed("filters", "hqdn3d")
-    if denoise_mode == "required" and not hqdn3d: raise PlanError("Denoising was required, but FFmpeg does not provide hqdn3d.")
-    denoise = hqdn3d and (denoise_mode == "required" or (denoise_mode == "auto" and (source["codec"] in {"mpeg1video", "mpeg2video", "mpeg4", "wmv1", "wmv2"} or (source["height"] <= 720 and source["format_bitrate"] >= 12_000_000))))
+    legacy_runtime = _legacy_runtime(capability) if encoder == "hevc_qsv_legacy" else None
+    denoise_name = "atadenoise" if legacy_runtime else "hqdn3d"
+    denoise_filter = LEGACY_DENOISE_FILTER if legacy_runtime else DENOISE_FILTER
+    denoise_available = _listed("filters", denoise_name) and (
+        legacy_runtime is None or _legacy_filter_available(legacy_runtime, denoise_name)
+    )
+    if denoise_mode == "required" and not denoise_available:
+        raise PlanError(f"Denoising was required, but the selected runtime does not provide {denoise_name}.")
+    denoise = denoise_available and (denoise_mode == "required" or (denoise_mode == "auto" and (source["codec"] in {"mpeg1video", "mpeg2video", "mpeg4", "wmv1", "wmv2"} or (source["height"] <= 720 and source["format_bitrate"] >= 12_000_000))))
     recipe: dict[str, Any] = {
         "encoder": encoder, "quality": quality,
         "resolution": {"mode": "source" if target_height == source["height"] else "maximum_height", "width": target_width, "height": target_height},
-        "denoise": {"mode": "hqdn3d" if denoise else "none", "filter": DENOISE_FILTER if denoise else None},
+        "denoise": {"mode": denoise_name if denoise else "none", "filter": denoise_filter if denoise else None},
         "container": "matroska", "audio": _audio_recipe(requirements, source), "preserve_all": True,
     }
     if encoder == "hevc_qsv_legacy":
-        recipe["runtime"] = _legacy_runtime(capability)
+        recipe["runtime"] = legacy_runtime
         recipe["legacy_profile"] = "safe-v1"
     if encoder == "hevc_vaapi":
         detail, device = str(capability.get("detail", "")), str(capability.get("detail", "")).split(",", 1)[0]

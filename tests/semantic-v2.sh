@@ -176,8 +176,8 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 import hevcplan_execute as executor
-from hevcplan_contract import choose_encoder, encoder_runtime, runtime_fingerprint
-from hevcplan_quality import video_encode_args
+from hevcplan_contract import _legacy_filter_available, choose_encoder, encoder_runtime, runtime_fingerprint
+from hevcplan_quality import software_filter, video_encode_args
 req={'hardware_policy':'auto_hardware_only','requested_encoder':'hevc_nvenc'}
 report={'auto_encoder':'hevc_qsv','encoders':[{'name':'hevc_nvenc','usable':True,'class':'hardware'},{'name':'hevc_qsv','usable':True,'class':'hardware'}]}
 assert choose_encoder(req, report)[:2] == ('hevc_nvenc','hardware')
@@ -201,7 +201,7 @@ with tempfile.TemporaryDirectory() as raw:
     root=Path(raw); (root/'bin').mkdir(); (root/'lib/dri').mkdir(parents=True)
     for name in ('ffmpeg','ffprobe'):
         tool=root/'bin'/name
-        tool.write_text('#!/bin/sh\nprintf "legacy-test-runtime\n"\n',encoding='utf-8')
+        tool.write_text('#!/bin/sh\nprintf " TS atadenoise V->V\n"\n',encoding='utf-8')
         tool.chmod(0o755)
     (root/'runtime-manifest.txt').write_text('runtime_kind=intel-media-sdk-legacy\n',encoding='utf-8')
     (root/'lib/dri/iHD_drv_video.so').write_text('driver',encoding='utf-8')
@@ -213,6 +213,9 @@ with tempfile.TemporaryDirectory() as raw:
     fingerprint=runtime_fingerprint('hevc_qsv_legacy',recipe)
     assert fingerprint['components']['runtime_manifest'].startswith('sha256:')
     assert fingerprint['components']['driver'].startswith('sha256:')
+    assert _legacy_filter_available(recipe['runtime'],'atadenoise') is True
+    recipe['denoise']={'mode':'atadenoise','filter':'atadenoise'}
+    assert software_filter(recipe) == 'atadenoise'
     recipe['audio']={'tracks':[{'output_audio_index':0,'mode':'opus','bitrate':128000}]}
     requirements={'input':str(root/'source.mkv'),'output':str(root/'output.mkv')}
     (root/'source.mkv').write_text('source',encoding='utf-8')

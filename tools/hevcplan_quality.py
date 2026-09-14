@@ -19,7 +19,7 @@ from hevcplan_contract import PlanError, encoder_runtime, planning_quality_targe
 
 def software_filter(recipe: dict[str, Any]) -> str:
     filters: list[str] = []
-    if recipe["denoise"]["mode"] == "hqdn3d": filters.append(recipe["denoise"]["filter"])
+    if recipe["denoise"]["mode"] != "none": filters.append(recipe["denoise"]["filter"])
     resolution = recipe["resolution"]
     if resolution["mode"] != "source": filters.append(f"scale={resolution['width']}:{resolution['height']}:flags=lanczos")
     return ",".join(filters)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# 265Encode 3.1.0.
+# 265Encode 3.1.1.
 # Hardware HEVC encoding is capability-proven and hardware-only in AUTO.
 # Protocol 2 exposes semantic requirements, sealed plans, fingerprints,
 # predictions, preservation, and validated atomic execution to dependent tools.
@@ -9,7 +9,7 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.1.1"
 LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
 HARDWARE_PROBE_SIZE="256x256"
