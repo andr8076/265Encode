@@ -12,7 +12,7 @@ python3 -m py_compile \
     "$ROOT/tools/hevcplan_execute.py" \
     "$ROOT/tools/legacy-intel-calibration.py"
 
-[[ $("$ROOT/265Encode.sh" --version) == "265Encode.sh 3.0.0" ]]
+[[ $("$ROOT/265Encode.sh" --version) == "265Encode.sh 3.1.0" ]]
 [[ $("$ROOT/265Encode.sh" --interface-version) == 2 ]]
 "$ROOT/265Encode.sh" --machine-negotiate 1 |
     python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["compatible"] is False'
@@ -35,11 +35,14 @@ assert all(features.get(name) is True for name in required)
 records={item["name"]:item for item in value["encoders"]}
 assert records["libx265"]["class"] == "software"
 assert records["libx265"]["auto_eligible"] is False
+assert records["hevc_qsv_legacy"]["class"] == "hardware"
+assert records["hevc_qsv_legacy"]["auto_eligible"] is True
 auto=value["auto_encoder"]
 assert auto is None or (
     records[auto]["class"] == "hardware" and records[auto]["usable"] is True
 )
-assert features["legacy_intel_protocol2"] is False
+assert features["legacy_intel_protocol2"] is True
+assert features["legacy_intel_auto_transparent"] is True
 '
 
 python3 - "$ROOT/265Encode.sh" <<'PY'

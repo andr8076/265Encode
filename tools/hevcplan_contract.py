@@ -16,13 +16,17 @@ SUPPORTED_PROTOCOLS = (2,)
 REQUIREMENTS_SCHEMA = "encode265.requirements"
 PLAN_SCHEMA = "encode265.plan"
 RESULT_SCHEMA = "encode265.plan-result"
-PLANNER_VERSION = "4"
+PLANNER_VERSION = "5"
 VMAF_PLANNING_MARGIN = 0.5
 DENOISE_FILTER = "hqdn3d=1.2:1.0:3.0:2.5"
 SUPPORTED_ENCODERS = {
-    "hevc_vaapi", "hevc_nvenc", "hevc_qsv", "hevc_videotoolbox", "libx265",
+    "hevc_vaapi", "hevc_nvenc", "hevc_qsv", "hevc_qsv_legacy",
+    "hevc_videotoolbox", "libx265",
 }
-HARDWARE_ENCODERS = {"hevc_vaapi", "hevc_nvenc", "hevc_qsv", "hevc_videotoolbox"}
+HARDWARE_ENCODERS = {
+    "hevc_vaapi", "hevc_nvenc", "hevc_qsv", "hevc_qsv_legacy",
+    "hevc_videotoolbox",
+}
 
 
 class PlanError(RuntimeError):
@@ -204,21 +208,63 @@ def implementation_fingerprint(root: Path) -> dict[str, Any]:
     files = [
         root / "265Encode.sh", root / "tools" / "HEVCPlan.py", root / "tools" / "hevcplan_contract.py",
         root / "tools" / "hevcplan_quality.py", root / "tools" / "hevcplan_execute.py",
-        root / "tools" / "265Compare.py",
+        root / "tools" / "265Compare.py", root / "tools" / "legacy-intel.sh",
+        root / "tools" / "legacy-intel-calibration.py",
     ]
     record = {"planner_version": PLANNER_VERSION, "protocol_version": PROTOCOL_VERSION, "files": {str(path.relative_to(root)): file_digest(path) for path in files}}
     return {"algorithm": "sha256", "value": digest(record), "components": record}
 
 
-def runtime_fingerprint(encoder: str) -> dict[str, Any]:
-    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
-    if not ffmpeg or not ffprobe:
-        raise PlanError("ffmpeg and ffprobe are required.")
+def encoder_runtime(recipe: dict[str, Any], tool: str = "ffmpeg") -> tuple[str, dict[str, str]]:
+    if recipe.get("encoder") != "hevc_qsv_legacy":
+        executable = shutil.which(tool)
+        if not executable:
+            raise PlanError(f"{tool} is required.")
+        return executable, os.environ.copy()
+    runtime = recipe.get("runtime")
+    if not isinstance(runtime, dict):
+        raise PlanError("Legacy Intel recipe has no sealed runtime.")
+    executable = Path(str(runtime.get(tool, "")))
+    driver_dir = Path(str(runtime.get("driver_dir", "")))
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise PlanError(f"Legacy Intel {tool} is missing or not executable.")
+    if not (driver_dir / "iHD_drv_video.so").is_file():
+        raise PlanError("Legacy Intel driver is missing from the isolated runtime.")
+    environment = os.environ.copy()
+    environment.update({
+        "INTEL_MEDIA_RUNTIME": "MSDK",
+        "LD_LIBRARY_PATH": str(executable.parent.parent / "lib"),
+        "LIBVA_DRIVERS_PATH": str(driver_dir),
+        "LIBVA_DRIVER_NAME": "iHD",
+    })
+    return str(executable), environment
+
+
+def runtime_fingerprint(encoder: str, recipe: dict[str, Any]) -> dict[str, Any]:
+    ffmpeg, environment = encoder_runtime(recipe)
+    ffprobe, _ = encoder_runtime(recipe, "ffprobe")
     components: dict[str, Any] = {
         "ffmpeg_path": str(Path(ffmpeg).resolve()), "ffprobe_path": str(Path(ffprobe).resolve()),
-        "ffmpeg_version": command_output([ffmpeg, "-version"]).splitlines()[0],
-        "ffmpeg_buildconf": command_output([ffmpeg, "-buildconf"]), "encoder": encoder,
+        "ffmpeg_version": command_output([ffmpeg, "-version"], environment).splitlines()[0],
+        "ffmpeg_buildconf": command_output([ffmpeg, "-buildconf"], environment), "encoder": encoder,
     }
+    if encoder == "hevc_qsv_legacy":
+        runtime = recipe["runtime"]
+        manifest = Path(runtime["manifest"])
+        driver = Path(runtime["driver_dir"]) / "iHD_drv_video.so"
+        if not manifest.is_file():
+            raise PlanError("Legacy Intel runtime manifest is missing.")
+        host_ffmpeg, host_ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+        if not host_ffmpeg or not host_ffprobe:
+            raise PlanError("Host ffmpeg and ffprobe are required for legacy stream preservation.")
+        components.update({
+            "runtime_manifest": file_digest(manifest),
+            "driver": file_digest(driver),
+            "host_ffmpeg_path": str(Path(host_ffmpeg).resolve()),
+            "host_ffprobe_path": str(Path(host_ffprobe).resolve()),
+            "host_ffmpeg_version": command_output([host_ffmpeg, "-version"]).splitlines()[0],
+            "host_ffmpeg_buildconf": command_output([host_ffmpeg, "-buildconf"]),
+        })
     for tool, args in (("nvidia-smi", ["--query-gpu=name,driver_version", "--format=csv,noheader"]), ("vainfo", [])):
         executable = shutil.which(tool)
         if executable:
@@ -301,9 +347,26 @@ def _audio_recipe(requirements: dict[str, Any], source: dict[str, Any]) -> dict[
     return {"mode": mode, "tracks": tracks, "estimated_bitrate": estimated}
 
 
+def _legacy_runtime(capability: dict[str, Any]) -> dict[str, str]:
+    runtime = capability.get("runtime")
+    if not isinstance(runtime, dict):
+        raise PlanError("The legacy Intel capability did not report its isolated runtime.")
+    result = {name: str(runtime.get(name, "")) for name in ("ffmpeg", "ffprobe", "manifest", "driver_dir")}
+    if not all(Path(result[name]).is_absolute() for name in result):
+        raise PlanError("The legacy Intel capability reported a non-absolute runtime path.")
+    for name in ("ffmpeg", "ffprobe", "manifest"):
+        if not Path(result[name]).is_file():
+            raise PlanError(f"The legacy Intel runtime is missing {name}.")
+    if not (Path(result["driver_dir"]) / "iHD_drv_video.so").is_file():
+        raise PlanError("The legacy Intel runtime is missing its isolated driver.")
+    return result
+
+
 def recipe_for(encoder: str, requirements: dict[str, Any], source: dict[str, Any], capability: dict[str, Any]) -> dict[str, Any]:
     if encoder == "libx265":
         quality = {"kind": "crf", "value": 20, "preset": "slow"}
+    elif encoder == "hevc_qsv_legacy":
+        quality = {"kind": "qp", "value": 19, "preset": "legacy-safe-v1"}
     elif encoder == "hevc_videotoolbox":
         # Store a loss-oriented index so a larger value consistently means
         # lower quality across every backend. FFmpeg receives 100 - value.
@@ -323,6 +386,9 @@ def recipe_for(encoder: str, requirements: dict[str, Any], source: dict[str, Any
         "denoise": {"mode": "hqdn3d" if denoise else "none", "filter": DENOISE_FILTER if denoise else None},
         "container": "matroska", "audio": _audio_recipe(requirements, source), "preserve_all": True,
     }
+    if encoder == "hevc_qsv_legacy":
+        recipe["runtime"] = _legacy_runtime(capability)
+        recipe["legacy_profile"] = "safe-v1"
     if encoder == "hevc_vaapi":
         detail, device = str(capability.get("detail", "")), str(capability.get("detail", "")).split(",", 1)[0]
         if not device.startswith("/dev/"): raise PlanError("The selected VA-API capability did not report its render device.")

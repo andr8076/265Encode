@@ -36,7 +36,7 @@ def calculate_plan_id(plan: dict[str, Any]) -> str:
 def evaluate(requirements_path: Path, plan_path: Path, script: Path) -> dict[str, Any]:
     if not plan_path.expanduser().resolve().parent.is_dir():raise PlanError(f"Plan directory does not exist: {plan_path.parent}")
     root=script.parent.resolve();requirements=normalize_requirements(read_json(requirements_path));source=probe_source(Path(requirements["input"]));report=capabilities(script);encoder,encoder_class,capability=choose_encoder(requirements,report);recipe=recipe_for(encoder,requirements,source,capability)
-    fingerprints={"implementation":implementation_fingerprint(root),"runtime":runtime_fingerprint(encoder),"source":source_fingerprint(Path(requirements["input"])),"requirements":{"algorithm":"sha256","value":digest(requirements)}}
+    fingerprints={"implementation":implementation_fingerprint(root),"runtime":runtime_fingerprint(encoder,recipe),"source":source_fingerprint(Path(requirements["input"])),"requirements":{"algorithm":"sha256","value":digest(requirements)}}
     prediction=predict(root,requirements,encoder,recipe,source);ready=bool(prediction["quality"]["target_met_on_sample"])
     plan={"schema":PLAN_SCHEMA,"protocol_version":PROTOCOL_VERSION,"created_at":datetime.now(timezone.utc).isoformat(),"requirements":requirements,"fingerprints":fingerprints,"selection":{"encoder":encoder,"class":encoder_class,"policy_owner":"265Encode"},"recipe":recipe,"prediction":prediction,"execution":{"state":"ready" if ready else "rejected","reason":None if ready else "sample_quality_below_target"}}
     plan["plan_id"]=calculate_plan_id(plan);atomic_json(plan_path,plan);return plan
@@ -50,14 +50,15 @@ def verify_plan(plan: dict[str, Any], script: Path) -> None:
     if requirements["hardware_policy"]=="manual_software":
         if (encoder,encoder_class)!=("libx265","software"):raise PlanError("Plan selection violates manual_software policy.")
     elif encoder not in HARDWARE_ENCODERS or encoder_class!="hardware":raise PlanError("Plan selection violates auto_hardware_only policy.")
-    source=probe_source(Path(requirements["input"]));recipe=plan.get("recipe");capability={}
-    if encoder=="hevc_vaapi" and isinstance(recipe,dict):capability["detail"]=str(recipe.get("vaapi_device",""))+( ", 10-bit sealed plan" if recipe.get("vaapi_upload_format")=="p010le" else ", 8-bit sealed plan")
+    source=probe_source(Path(requirements["input"]));recipe=plan.get("recipe")
+    report=capabilities(script);capability=next((item for item in report.get("encoders",[]) if isinstance(item,dict) and item.get("name")==encoder),None)
+    if not capability or capability.get("usable") is not True:raise PlanError(f"Planned HEVC encoder is no longer capability-proven usable: {encoder}")
     expected=recipe_for(encoder,requirements,source,capability);quality=recipe.get("quality") if isinstance(recipe,dict) else None;expected_quality=expected["quality"];maximum=99 if encoder=="hevc_videotoolbox" else 51
     if not isinstance(quality,dict) or quality.get("kind")!=expected_quality["kind"] or quality.get("preset")!=expected_quality["preset"] or isinstance(quality.get("value"),bool) or not isinstance(quality.get("value"),int) or not 0<=quality["value"]<=maximum:raise PlanError("Plan recipe has an invalid calibrated quality policy.")
     expected["quality"]["value"]=quality["value"]
     if recipe!=expected:raise PlanError("Plan recipe is not the current 265Encode policy recipe.")
     if (plan.get("execution") or {}).get("state")!="ready":raise PlanError("Plan is not executable because its sampled quality target was not met.")
-    root=script.parent.resolve();current={"implementation":implementation_fingerprint(root),"runtime":runtime_fingerprint(encoder),"source":source_fingerprint(Path(requirements["input"])),"requirements":{"algorithm":"sha256","value":digest(requirements)}};saved=plan.get("fingerprints")
+    root=script.parent.resolve();current={"implementation":implementation_fingerprint(root),"runtime":runtime_fingerprint(encoder,expected),"source":source_fingerprint(Path(requirements["input"])),"requirements":{"algorithm":"sha256","value":digest(requirements)}};saved=plan.get("fingerprints")
     for name,value in current.items():
         if not isinstance(saved,dict) or saved.get(name,{}).get("value")!=value["value"]:raise PlanError(f"Plan is stale: {name} fingerprint changed; evaluate again.")
 
