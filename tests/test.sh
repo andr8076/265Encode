@@ -65,6 +65,6 @@ PY
 
 python3 -m json.tool "$ROOT/docs/requirements-v2.schema.json" >/dev/null
 python3 "$ROOT/tools/test_legacy_intel_calibration.py"
-python3 "$ROOT/tools/test_size_guard.py"
+python3 "$ROOT/tests/test_size_guard.py"
 bash "$ROOT/tests/semantic-v2.sh"
 printf '265Encode policy and protocol tests passed.\n'
