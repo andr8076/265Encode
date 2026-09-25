@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Bounded content calibration for 265Encode's Intel Gen9 legacy HEVC path.
+"""Size-saving quality calibration for 265Encode's Intel Gen9 legacy HEVC path.
 
-The safe profile was validated against libx265 CRF20/slow on multiple complete
-videos. Calibration samples the source and, when available, builds bounded
-libx265 CRF20/slow reference samples as the quality oracle. It selects the
-smallest proven legacy profile that remains inside a tight VMAF envelope around
-that reference. If the software oracle is unavailable, selection falls back to
-the conservative safe-profile envelope; inconclusive runs still fall back to
-``safe``.
+Candidates are scored against the original source. Calibration chooses the
+smallest candidate that clears the source-relative VMAF floor and is predicted
+to use at least five percent fewer sampled video bytes than the source. It
+fails closed when no candidate meets both conditions.
 """
 from __future__ import annotations
 
@@ -26,16 +23,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-POLICY_VERSION = "p530-content-calibration-v2-cpu-oracle"
+POLICY_VERSION = "p530-size-save-v1-source-vmaf"
 DEFAULT_SAMPLE_SECONDS = 3.0
 DEFAULT_MAX_WINDOWS = 5
-MEAN_DELTA_LIMIT = 0.80
-P10_DELTA_LIMIT = 1.50
-CPU_MEAN_DELTA_LIMIT = 0.60
-CPU_P10_DELTA_LIMIT = 0.90
-CPU_SAMPLE_TIMEOUT_SECONDS = 120
-ABSOLUTE_MEAN_FLOOR = 92.0
-ABSOLUTE_P10_FLOOR = 88.0
+MIN_OVERALL_MEAN_VMAF = 90.0
+MIN_WINDOW_MEAN_VMAF = 87.5
+MIN_AVERAGE_WINDOW_P10_VMAF = 80.0
+MAX_SAMPLE_SIZE_RATIO = 0.95
 
 COMMON_ARGS = (
     "-c:v", "hevc_qsv",
@@ -46,44 +40,15 @@ COMMON_ARGS = (
     "-g", "600",
 )
 
-# Profiles are intentionally few and already exercised on the target P530.
-# Selection is based on measured sample bytes, not this declaration order.
+# QP steps are sampled across the useful legacy encoder range. Calibration
+# picks the smallest candidate that still meets source-relative quality bounds.
 PROFILES: dict[str, tuple[str, ...]] = {
-    "compact": COMMON_ARGS + (
-        "-q:v", "19",
-        "-bf", "7",
-        "-refs", "4",
-    ),
-    "efficient": COMMON_ARGS + (
-        "-q:v", "17",
-        "-bf", "15",
-        "-refs", "5",
-    ),
-    "matched": COMMON_ARGS + (
-        "-q:v", "18",
-        "-b_qfactor", "1",
-        "-b_qoffset", "2",
-        "-bf", "15",
-        "-refs", "5",
-    ),
-    "balanced": COMMON_ARGS + (
-        "-q:v", "18",
-        "-i_qfactor", "-0.7777777778",
-        "-i_qoffset", "0",
-        "-b_qfactor", "1.0555555556",
-        "-b_qoffset", "0",
+    f"q{qp}": COMMON_ARGS + (
+        "-q:v", str(qp),
         "-bf", "6",
         "-refs", "4",
-    ),
-    "safe": COMMON_ARGS + (
-        "-q:v", "19",
-        "-i_qfactor", "-0.8421052632",
-        "-i_qoffset", "0",
-        "-b_qfactor", "0.9473684211",
-        "-b_qoffset", "0",
-        "-bf", "6",
-        "-refs", "4",
-    ),
+    )
+    for qp in range(20, 37, 2)
 }
 
 
@@ -128,34 +93,6 @@ def parse_vmaf_json(path: Path) -> Score:
     if not values:
         raise ValueError(f"no VMAF frame scores in {path}")
     return Score(statistics.fmean(values), percentile(values, 10.0))
-
-
-def candidate_accepts(reference: Sequence[Score], candidate: Sequence[Score]) -> bool:
-    if len(reference) != len(candidate) or not reference:
-        return False
-    for safe, trial in zip(reference, candidate):
-        if trial.mean < ABSOLUTE_MEAN_FLOOR or trial.p10 < ABSOLUTE_P10_FLOOR:
-            return False
-        if safe.mean - trial.mean > MEAN_DELTA_LIMIT:
-            return False
-        if safe.p10 - trial.p10 > P10_DELTA_LIMIT:
-            return False
-    return True
-
-
-def candidate_matches_cpu(reference: Sequence[Score], candidate: Sequence[Score]) -> bool:
-    if len(reference) != len(candidate) or not reference:
-        return False
-    for cpu, trial in zip(reference, candidate):
-        mean_floor = min(ABSOLUTE_MEAN_FLOOR, cpu.mean - CPU_MEAN_DELTA_LIMIT)
-        p10_floor = min(ABSOLUTE_P10_FLOOR, cpu.p10 - CPU_P10_DELTA_LIMIT)
-        if trial.mean < mean_floor or trial.p10 < p10_floor:
-            return False
-        if cpu.mean - trial.mean > CPU_MEAN_DELTA_LIMIT:
-            return False
-        if cpu.p10 - trial.p10 > CPU_P10_DELTA_LIMIT:
-            return False
-    return True
 
 
 def _run(command: Sequence[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -282,6 +219,57 @@ def plan_windows(
     return sorted(windows, key=lambda item: item.start)
 
 
+def source_video_bytes(
+    ffprobe: str, source: Path, windows: Sequence[Window],
+    env: dict[str, str] | None = None,
+) -> int:
+    command = [
+        ffprobe, "-v", "error", "-select_streams", "V:0",
+        "-show_packets", "-show_entries", "packet=pts_time,size",
+        "-of", "csv=p=0", str(source),
+    ]
+    proc = _run(command, env=env)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "source video packet scan failed")
+    total = 0
+    for row in csv.reader(proc.stdout.splitlines()):
+        if len(row) < 2:
+            continue
+        try:
+            pts, size = float(row[0]), int(row[1])
+        except (ValueError, OverflowError):
+            continue
+        if not math.isfinite(pts) or size <= 0:
+            continue
+        if any(window.start <= pts < window.start + window.length for window in windows):
+            total += size
+    if total <= 0:
+        raise RuntimeError("could not measure source video bytes in calibration windows")
+    return total
+
+
+def candidate_meets_source_quality(candidate: Sequence[Score]) -> bool:
+    if not candidate:
+        return False
+    overall_mean = statistics.fmean(score.mean for score in candidate)
+    average_window_p10 = statistics.fmean(score.p10 for score in candidate)
+    worst_window_mean = min(score.mean for score in candidate)
+    return (
+        overall_mean >= MIN_OVERALL_MEAN_VMAF
+        and worst_window_mean >= MIN_WINDOW_MEAN_VMAF
+        and average_window_p10 >= MIN_AVERAGE_WINDOW_P10_VMAF
+    )
+
+
+def candidate_meets_size_and_quality(
+    candidate: Sequence[Score], output_bytes: int, source_bytes: int,
+) -> bool:
+    if output_bytes <= 0 or source_bytes <= 0:
+        return False
+    return (
+        output_bytes <= source_bytes * MAX_SAMPLE_SIZE_RATIO
+        and candidate_meets_source_quality(candidate)
+    )
 def build_legacy_env(runtime: Path, driver_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["INTEL_MEDIA_RUNTIME"] = "MSDK"
@@ -321,44 +309,6 @@ def encode_window(
     return output.stat().st_size
 
 
-def encode_cpu_reference_window(
-    ffmpeg: str, source: Path, window: Window, output: Path
-) -> int:
-    command = [
-        ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-y",
-        "-ss", f"{window.start:.6f}", "-t", f"{window.length:.6f}",
-        "-i", str(source), "-map", "0:v:0", "-an", "-sn", "-dn",
-        "-c:v", "libx265", "-crf", "20", "-preset", "slow",
-        "-pix_fmt", "yuv420p10le", "-f", "matroska", str(output),
-    ]
-    try:
-        proc = subprocess.run(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace", check=False,
-            timeout=CPU_SAMPLE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("CPU reference sample timed out") from exc
-    if proc.returncode != 0 or not output.is_file() or output.stat().st_size <= 0:
-        raise RuntimeError(f"CPU reference sample failed: {proc.stderr.strip()}")
-    return output.stat().st_size
-
-
-def software_encoder_fingerprint(ffmpeg: str) -> str:
-    resolved = shutil.which(ffmpeg) or ffmpeg
-    proc = _run([resolved, "-hide_banner", "-encoders"])
-    if proc.returncode != 0:
-        raise RuntimeError("system FFmpeg encoder inventory unavailable")
-    line = next((line for line in proc.stdout.splitlines() if "libx265" in line), "")
-    if not line:
-        raise RuntimeError("system FFmpeg libx265 reference encoder unavailable")
-    version = _run([resolved, "-version"])
-    if version.returncode != 0 or not version.stdout.splitlines():
-        raise RuntimeError("system FFmpeg version unavailable")
-    payload = "\0".join([str(Path(resolved).resolve()), version.stdout.splitlines()[0], line.strip()])
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
 def score_window(
     ffmpeg: Path,
     env: dict[str, str],
@@ -396,7 +346,6 @@ def cache_key(
     source: Path,
     legacy_manifest: Path,
     quality_manifest: Path,
-    software_fingerprint: str,
     sample_seconds: float,
     max_windows: int,
 ) -> str:
@@ -408,7 +357,6 @@ def cache_key(
         str(stat.st_mtime_ns),
         _manifest_hash(legacy_manifest),
         _manifest_hash(quality_manifest),
-        software_fingerprint,
         f"{sample_seconds:.6f}",
         str(max_windows),
     ])
@@ -423,16 +371,10 @@ def calibrate(args: argparse.Namespace) -> tuple[str, float, int, bool]:
     cache_root = Path(args.cache_root).expanduser().resolve()
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    try:
-        software_fingerprint = software_encoder_fingerprint(args.software_ffmpeg)
-    except Exception:
-        software_fingerprint = "unavailable"
-
     key = cache_key(
         source,
         legacy_runtime / "runtime-manifest.txt",
         quality_runtime / "runtime-manifest.txt",
-        software_fingerprint,
         args.sample_seconds,
         args.max_windows,
     )
@@ -452,19 +394,22 @@ def calibrate(args: argparse.Namespace) -> tuple[str, float, int, bool]:
     quality_env = build_quality_env(quality_runtime)
     duration = media_duration(str(quality_ffprobe), source, env=quality_env)
     if duration < 12.0:
-        return "safe", 1.0, 0, False
+        raise RuntimeError("source is too short for reliable size and quality calibration")
 
     windows = plan_windows(
         str(quality_ffprobe), source, duration, args.sample_seconds, args.max_windows, env=quality_env
     )
     if not windows:
-        return "safe", 1.0, 0, False
+        raise RuntimeError("no calibration windows could be selected from the source")
 
     legacy_env = build_legacy_env(legacy_runtime, driver_dir)
+    profile_order = tuple(PROFILES)
+    source_bytes = source_video_bytes(
+        str(quality_ffprobe), source, windows, env=quality_env
+    )
     results: dict[str, tuple[list[Score], int]] = {}
     work = Path(tempfile.mkdtemp(prefix="265encode-legacy-calibration.", dir=str(cache_root)))
     try:
-        profile_order = ("safe", "compact", "efficient", "matched", "balanced")
         for profile in profile_order:
             scores: list[Score] = []
             total_bytes = 0
@@ -483,49 +428,36 @@ def calibrate(args: argparse.Namespace) -> tuple[str, float, int, bool]:
                 )
             results[profile] = (scores, total_bytes)
 
-        safe_scores, safe_bytes = results["safe"]
-        oracle_scores: list[Score] | None = None
-        if software_fingerprint != "unavailable":
-            try:
-                oracle_dir = work / "cpu-oracle"
-                oracle_dir.mkdir()
-                oracle_scores = []
-                for index, window in enumerate(windows):
-                    encoded = oracle_dir / f"{index}.mkv"
-                    vmaf_log = oracle_dir / f"{index}.json"
-                    encode_cpu_reference_window(args.software_ffmpeg, source, window, encoded)
-                    oracle_scores.append(
-                        score_window(
-                            quality_ffmpeg, quality_env, source, encoded, window, vmaf_log
-                        )
-                    )
-            except Exception:
-                oracle_scores = None
-        qualifying: list[tuple[int, str]] = [(safe_bytes, "safe")]
-        if oracle_scores is not None:
-            qualifying = []
-            for profile in profile_order:
-                scores, size = results[profile]
-                if candidate_matches_cpu(oracle_scores, scores):
-                    qualifying.append((size, profile))
-            if not qualifying:
-                qualifying = [(safe_bytes, "safe")]
-            oracle = "cpu-crf20-slow"
-        else:
-            for profile in ("compact", "efficient", "matched", "balanced"):
-                scores, size = results[profile]
-                if candidate_accepts(safe_scores, scores):
-                    qualifying.append((size, profile))
-            oracle = "safe-profile-fallback"
-
+        qualifying = [
+            (size, profile)
+            for profile, (scores, size) in results.items()
+            if candidate_meets_size_and_quality(scores, size, source_bytes)
+        ]
+        if not qualifying:
+            diagnostics = []
+            for profile, (scores, size) in results.items():
+                mean = statistics.fmean(score.mean for score in scores)
+                worst = min(score.mean for score in scores)
+                p10 = statistics.fmean(score.p10 for score in scores)
+                ratio = size / source_bytes if source_bytes else float("inf")
+                diagnostics.append(
+                    f"{profile}: {ratio:.1%} size, mean {mean:.1f}, "
+                    f"worst-window mean {worst:.1f}, avg-window p10 {p10:.1f}"
+                )
+            raise RuntimeError(
+                "no legacy QP profile clears the source-relative VMAF floor "
+                "while saving at least five percent of sampled video bytes; "
+                + "; ".join(diagnostics)
+            )
         selected_bytes, selected = min(qualifying, key=lambda item: (item[0], item[1]))
-        ratio = selected_bytes / safe_bytes if safe_bytes > 0 else 1.0
+        ratio = selected_bytes / source_bytes
+
         payload = {
             "policy": POLICY_VERSION,
             "plan": selected,
             "ratio": ratio,
             "windows": len(windows),
-            "oracle": oracle,
+            "quality_policy": "source-relative-vmaf",
         }
         tmp = cache_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
@@ -541,7 +473,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--driver-dir", required=True)
     parser.add_argument("--quality-runtime", required=True)
     parser.add_argument("--cache-root", required=True)
-    parser.add_argument("--software-ffmpeg", default="ffmpeg")
     parser.add_argument("--sample-seconds", type=float, default=DEFAULT_SAMPLE_SECONDS)
     parser.add_argument("--max-windows", type=int, default=DEFAULT_MAX_WINDOWS)
     return parser

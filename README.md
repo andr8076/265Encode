@@ -1,4 +1,4 @@
-# 265Encode
+# 265Encode 3.2.0
 
 265Encode is a ready-to-run HEVC/H.265 batch encoder for Linux and macOS.
 It capability-probes real encodes before selecting hardware and keeps software
@@ -23,6 +23,7 @@ CPU. To explicitly allow software encoding:
 
 ```bash
 ./265Encode.sh --software --crf 20 --preset slow --yes movie.mkv
+./265Encode.sh --size-focused --recursive --yes "/path/to/videos"
 ```
 
 Use `./265Encode.sh --help` for traversal, audio, container, overwrite, and
@@ -39,9 +40,14 @@ Modern backends are tested with bounded real encodes:
 
 `libx265` is software and manual-only. On supported Skylake/P530 systems,
 265Encode automatically provisions and verifies its isolated legacy runtime,
-then performs content-aware quality calibration. This selection is identical
-for standalone and protocol-2 callers; Hardcore Archive does not need legacy
-Intel settings or special-case logic.
+then samples QP profiles against the source. It selects the smallest candidate
+that clears the source-relative VMAF floor and is predicted to use at least five
+percent fewer sampled video bytes. If no profile meets both conditions, that
+file is skipped. All completed outputs, including protocol-2 jobs and explicit
+manual settings, are rejected unless the final file is smaller than its source.
+Software encoding remains an explicit manual choice. Use `--size-focused` to
+explicitly select CPU libx265 and calibrate a CRF per source file. This is slower
+than hardware encoding and skips a file if no tested CRF meets both limits.
 
 ## Dependency interface
 

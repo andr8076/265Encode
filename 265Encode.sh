@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# 265Encode 3.1.1.
+# 265Encode 3.2.0.
 # Hardware HEVC encoding is capability-proven and hardware-only in AUTO.
 # Protocol 2 exposes semantic requirements, sealed plans, fingerprints,
 # predictions, preservation, and validated atomic execution to dependent tools.
@@ -9,14 +9,14 @@
 set -o pipefail
 
 SCRIPT_NAME="${0##*/}"
-SCRIPT_VERSION="3.1.1"
+SCRIPT_VERSION="3.2.0"
 LATEST_MACHINE_INTERFACE_VERSION="2"
 COMMON_EXTENSIONS=(mp4 mkv mov avi webm m4v ts mts m2ts wmv flv)
 HARDWARE_PROBE_SIZE="256x256"
 LEGACY_INTEL_HELPER_URL="https://raw.githubusercontent.com/andr8076/265Encode/main/tools/legacy-intel.sh"
 LEGACY_INTEL_HELPER_SHA256="cc6138e22f2fe22834e99ace011d8ae1fa8a021e7f5e1cbb281596f514756c38"
 LEGACY_INTEL_CALIBRATOR_URL="https://raw.githubusercontent.com/andr8076/265Encode/main/tools/legacy-intel-calibration.py"
-LEGACY_INTEL_CALIBRATOR_SHA256="f81b7bfdd5af9ba4edce0c58baee1b7469da4445381bc92317d5c55c8333f1d8"
+LEGACY_INTEL_CALIBRATOR_SHA256="566fd0a66f78cafb9e8ec538eb4ba9d1d9a508eac9ec5f166fc5be8de317f45d"
 LEGACY_INTEL_DEVICE_ID=""
 LEGACY_INTEL_ADDON_LOADED="no"
 LEGACY_INTEL_FFMPEG_COMMAND=()
@@ -40,6 +40,8 @@ LIST_HARDWARE_ONLY="no"
 DEBUG_HARDWARE="no"
 LEGACY_INTEL_AUTO="${ENCODE265_INTEL_LEGACY_AUTO:-1}"
 SOFTWARE_CRF="20"
+SOFTWARE_CRF_EXPLICIT="no"
+SIZE_FOCUSED_MODE="no"
 SOFTWARE_PRESET="slow"
 HARDWARE_QP="24"
 HARDWARE_QP_EXPLICIT="no"
@@ -76,6 +78,8 @@ Encoding:
   -m, --mode MODE          auto, software, or hardware
       --auto               Automatically select a working hardware encoder
       --software           Explicitly allow libx265 CPU encoding
+      --size-focused       Explicitly use CPU libx265, calibrate per file
+                           to save size while meeting source-relative VMAF floors
       --hardware           Require hardware HEVC encoding
       --crf NUMBER         libx265 CRF, default: 20
       --preset NAME        libx265 preset, default: slow
@@ -127,6 +131,7 @@ Examples:
   $SCRIPT_NAME --hardware --recursive --skip-hevc --container mkv "/path/to/videos"
 
   $SCRIPT_NAME --software --crf 18 --preset slow --copy-audio "movie.mkv"
+  $SCRIPT_NAME --size-focused --recursive --yes "/path/to/videos"
 
   $SCRIPT_NAME --interactive --input "/path/to/videos" --hardware
 EOF_USAGE
@@ -239,6 +244,11 @@ parse_arguments() {
                 MODE="software"
                 shift
                 ;;
+            --size-focused)
+                SIZE_FOCUSED_MODE="yes"
+                MODE="software"
+                shift
+                ;;
             --hardware)
                 MODE="hardware"
                 shift
@@ -246,6 +256,7 @@ parse_arguments() {
             --crf)
                 require_value "$1" "${2-}"
                 SOFTWARE_CRF="$2"
+                SOFTWARE_CRF_EXPLICIT="yes"
                 shift 2
                 ;;
             --preset)
@@ -362,6 +373,15 @@ validate_options() {
             exit 2
             ;;
     esac
+
+    if [[ "$SIZE_FOCUSED_MODE" == "yes" && "$MODE" != "software" ]]; then
+        error "--size-focused requires the explicit software mode."
+        exit 2
+    fi
+    if [[ "$SIZE_FOCUSED_MODE" == "yes" && "$SOFTWARE_CRF_EXPLICIT" == "yes" ]]; then
+        error "--size-focused chooses CRF per file; do not combine it with --crf."
+        exit 2
+    fi
 
     if ! is_integer_in_range "$SOFTWARE_CRF" 0 51; then
         error "--crf must be an integer from 0 to 51."
@@ -529,7 +549,7 @@ legacy_intel_fetch_quality_runtime() {
     asset="$selected"
     archive="$tmp/$asset"
     checksum="$archive.sha256"
-    printf '265Encode: downloading one-time VMAF runtime for legacy Intel calibration...\n' >&2
+    printf '265Encode: downloading one-time VMAF calibration runtime...\n' >&2
     if ! legacy_intel_download "$base/$asset" "$archive" || ! legacy_intel_download "$base/$asset.sha256" "$checksum"; then
         rm -rf "$tmp"
         return 1
@@ -612,6 +632,14 @@ legacy_intel_set_plan_args() {
                 -bf 6 -refs 4 -g 600
             )
             ;;
+        q[0-9][0-9])
+            local qp="${plan#q}"
+            VIDEO_ENCODER_ARGS=(
+                -c:v hevc_qsv -load_plugin hevc_hw -low_power 0
+                -q:v "$qp" -preset:v veryslow -pix_fmt nv12
+                -bf 6 -refs 4 -g 600
+            )
+            ;;
         manual)
             VIDEO_ENCODER_ARGS=(
                 -c:v hevc_qsv -load_plugin hevc_hw -low_power 0
@@ -654,12 +682,12 @@ configure_legacy_intel_file() {
         return 0
     fi
     if ! legacy_intel_fetch_quality_runtime || ! legacy_intel_fetch_calibrator; then
-        echo "Legacy Intel tuning: calibration unavailable; using verified safe preset."
-        return 0
+        echo "Legacy Intel tuning: source-relative size calibration unavailable."
+        return 1
     fi
 
     cache="${XDG_CACHE_HOME:-$HOME/.cache}/265Encode/intel-legacy-calibration"
-    mkdir -p "$cache" || return 0
+    mkdir -p "$cache" || return 1
     log="$cache/last-calibration-error.log"
     result="$(python3 "$LEGACY_INTEL_CALIBRATOR" \
         --source "$input_file" \
@@ -668,25 +696,25 @@ configure_legacy_intel_file() {
         --quality-runtime "$LEGACY_INTEL_QUALITY_RUNTIME" \
         --cache-root "$cache" 2>"$log")" || {
             debug_log "Legacy Intel calibration failed; see $log"
-            echo "Legacy Intel tuning: calibration failed; using verified safe preset."
-            return 0
+            echo "Legacy Intel tuning: calibration failed; refusing an unmeasured encode."
+            return 1
         }
 
     IFS='|' read -r plan ratio windows provenance <<< "$result"
     case "$plan" in
-        compact|efficient|matched|balanced|safe) ;;
+        q[0-9][0-9]) ;;
         *)
             debug_log "Legacy Intel calibrator returned invalid plan: $result"
-            echo "Legacy Intel tuning: invalid calibration result; using verified safe preset."
-            return 0
+            echo "Legacy Intel tuning: invalid calibration result; refusing an unmeasured encode."
+            return 1
             ;;
     esac
     legacy_intel_set_plan_args "$plan"
     ratio_percent="$(awk -v ratio="${ratio:-1}" 'BEGIN { printf "%.1f", ratio * 100 }')"
     if [[ "$provenance" == "cache" ]]; then
-        echo "Legacy Intel tuning: $plan preset (cached; sampled size ${ratio_percent}% of safe)."
+        echo "Legacy Intel tuning: $plan (cached; sampled video size ${ratio_percent}% of source)."
     else
-        echo "Legacy Intel tuning: $plan preset selected from ${windows:-0} bounded samples (sampled size ${ratio_percent}% of safe)."
+        echo "Legacy Intel tuning: $plan selected from ${windows:-0} bounded samples (sampled video size ${ratio_percent}% of source)."
     fi
 }
 
@@ -1382,6 +1410,64 @@ print_command() {
     printf '\n'
 }
 
+configure_size_focused_software_file() {
+    local input_file="$1"
+    local script_dir helper cache result profile ratio windows provenance crf
+
+    if [[ "$DRY_RUN" == "yes" ]]; then
+        echo "Size-focused software calibration is skipped during dry-run."
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || {
+        error "python3 is required for --size-focused."
+        return 1
+    }
+    if ! legacy_intel_fetch_quality_runtime; then
+        error "VMAF runtime is unavailable; refusing an uncalibrated size-focused encode."
+        return 1
+    fi
+
+    script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    helper="$script_dir/tools/software-size-calibration.py"
+    [[ -r "$helper" ]] || {
+        error "Missing size calibration helper: $helper"
+        return 1
+    }
+
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/265Encode/software-calibration"
+    mkdir -p "$cache" || return 1
+    result="$(python3 "$helper" \
+        --source "$input_file" \
+        --quality-runtime "$LEGACY_INTEL_QUALITY_RUNTIME" \
+        --cache-root "$cache" \
+        --preset "$SOFTWARE_PRESET" 2>"$cache/last-calibration-error.log")" || {
+            error "No tested libx265 profile meets the size and quality limits; see $cache/last-calibration-error.log."
+            return 1
+        }
+
+    IFS='|' read -r profile ratio windows provenance <<< "$result"
+    case "$profile" in
+        crf[0-9][0-9]) crf="${profile#crf}" ;;
+        *)
+            error "Size calibrator returned an invalid profile: $result"
+            return 1
+            ;;
+    esac
+
+    VIDEO_ENCODER_ARGS=(
+        -c:v libx265
+        -crf "$crf"
+        -preset "$SOFTWARE_PRESET"
+        -pix_fmt yuv420p10le
+    )
+    ACTIVE_ENCODER="libx265 CPU (size-focused CRF $crf)"
+    if [[ "$provenance" == "cache" ]]; then
+        echo "Size-focused software calibration: cached CRF $crf; sampled video size ${ratio}% of source."
+    else
+        echo "Size-focused software calibration: CRF $crf from $windows source samples; sampled video size ${ratio}% of source."
+    fi
+}
+
 validate_completed_output() {
     local source="$1" candidate="$2" codec source_duration output_duration
 
@@ -1389,6 +1475,14 @@ validate_completed_output() {
         error "Encoding produced no output file."
         return 1
     }
+    local source_size candidate_size
+    source_size=$(wc -c < "$source" | tr -d '[:space:]')
+    candidate_size=$(wc -c < "$candidate" | tr -d '[:space:]')
+    if (( candidate_size >= source_size )); then
+        error "Rejected output: candidate is not smaller than the source ($candidate_size >= $source_size bytes)."
+        return 1
+    fi
+
     codec=$(ffprobe -v error -select_streams V:0 -show_entries stream=codec_name \
         -of csv=p=0 "$candidate" 2>/dev/null | head -n1)
     [[ $codec == hevc ]] || {
@@ -1451,8 +1545,16 @@ encode_file() {
     fi
 
     analyze_video "$input_file" || return 0
+    if [[ "$SIZE_FOCUSED_MODE" == "yes" ]]; then
+        if ! configure_size_focused_software_file "$input_file"; then
+            return 1
+        fi
+    fi
     if [[ "$ACTIVE_MODE" == "hardware" && "$HW_TYPE" == "intel-legacy" ]]; then
-        configure_legacy_intel_file "$input_file"
+        if ! configure_legacy_intel_file "$input_file"; then
+            error "Skipping because no tested legacy QP meets the size and quality limits."
+            return 1
+        fi
     fi
     build_file_video_filter
 

@@ -6,13 +6,14 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 bash -n "$ROOT/265Encode.sh" "$ROOT/tools/legacy-intel.sh"
 python3 -m py_compile \
     "$ROOT/tools/265Compare.py" \
+    "$ROOT/tools/software-size-calibration.py" \
     "$ROOT/tools/HEVCPlan.py" \
     "$ROOT/tools/hevcplan_contract.py" \
     "$ROOT/tools/hevcplan_quality.py" \
     "$ROOT/tools/hevcplan_execute.py" \
     "$ROOT/tools/legacy-intel-calibration.py"
 
-[[ $("$ROOT/265Encode.sh" --version) == "265Encode.sh 3.1.1" ]]
+[[ $("$ROOT/265Encode.sh" --version) == "265Encode.sh 3.2.0" ]]
 [[ $("$ROOT/265Encode.sh" --interface-version) == 2 ]]
 "$ROOT/265Encode.sh" --machine-negotiate 1 |
     python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["compatible"] is False'
@@ -55,10 +56,15 @@ assert 'selected_mode="software"' not in auto
 assert 'Select mode [1]:' in text
 assert 'MODE="auto"' in text
 assert 'validate_completed_output "$input_file" "$temporary_output"' in text
+assert 'candidate_size >= source_size' in text
+assert 'configure_size_focused_software_file' in text
+assert 'SIZE_FOCUSED_MODE="yes"' in text
+assert 'no tested legacy QP meets the size and quality limits' in text
 assert 'Completed output was rejected and removed; the input is unchanged.' in text
 PY
 
 python3 -m json.tool "$ROOT/docs/requirements-v2.schema.json" >/dev/null
 python3 "$ROOT/tools/test_legacy_intel_calibration.py"
+python3 "$ROOT/tests/test_size_guard.py"
 bash "$ROOT/tests/semantic-v2.sh"
 printf '265Encode policy and protocol tests passed.\n'
