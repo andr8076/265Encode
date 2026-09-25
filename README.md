@@ -1,8 +1,8 @@
 # 265Encode 3.2.0
 
 265Encode is a ready-to-run HEVC/H.265 batch encoder for Linux and macOS.
-It capability-probes real encodes before selecting hardware and keeps software
-encoding behind an explicit manual choice.
+It capability-probes real encodes before selecting hardware and preserves the
+source bit depth, using software when available hardware cannot encode it.
 
 ## Standalone use
 
@@ -18,8 +18,10 @@ Or encode one file non-interactively:
 ./265Encode.sh --auto --yes movie.mkv
 ```
 
-AUTO selects only a working hardware encoder. It never silently falls back to
-CPU. To explicitly allow software encoding:
+AUTO prefers a working hardware encoder. For sources above 8-bit, it selects
+10-bit-capable hardware or falls back to CPU `libx265` to preserve bit depth.
+For 8-bit sources, AUTO keeps its hardware-only behavior. To explicitly choose
+software for any source:
 
 ```bash
 ./265Encode.sh --software --crf 20 --preset slow --yes movie.mkv
@@ -38,16 +40,18 @@ Modern backends are tested with bounded real encodes:
 - Intel Skylake/P530 compatibility: `hevc_qsv_legacy`
 - Apple VideoToolbox: `hevc_videotoolbox`
 
-`libx265` is software and manual-only. On supported Skylake/P530 systems,
-265Encode automatically provisions and verifies its isolated legacy runtime,
-then samples QP profiles against the source. It selects the smallest candidate
-that clears the source-relative VMAF floor and is predicted to use at least five
-percent fewer sampled video bytes. If no profile meets both conditions, that
-file is skipped. All completed outputs, including protocol-2 jobs and explicit
-manual settings, are rejected unless the final file is smaller than its source.
-Software encoding remains an explicit manual choice. Use `--size-focused` to
-explicitly select CPU libx265 and calibrate a CRF per source file. This is slower
-than hardware encoding and skips a file if no tested CRF meets both limits.
+`libx265` is software. AUTO uses it only when needed to preserve a source above
+8-bit and no proven 10-bit hardware encoder is available. On supported
+Skylake/P530 systems, 265Encode automatically provisions and verifies its
+isolated legacy runtime, then samples QP profiles against the source. It selects
+the smallest candidate that clears the source-relative VMAF floor and is
+predicted to use at least five percent fewer sampled video bytes. If no profile
+meets both conditions, that file is skipped. All completed outputs, including
+protocol-2 jobs and explicit settings, are rejected unless the final file is
+smaller than its source. Use `--size-focused` to explicitly select CPU libx265
+and calibrate a CRF per source file; this is slower and skips files that do not
+meet both limits. For 10-bit sources on older hardware, AUTO also falls back to
+10-bit CPU encoding to preserve bit depth.
 
 ## Dependency interface
 
@@ -69,7 +73,7 @@ codec, duration, stream-count, and full video/audio decode validation.
 
 The interface supports:
 
-- hardware-only AUTO, including transparent legacy Intel selection, and explicit manual `libx265`;
+- hardware-preferred AUTO with source bit-depth preservation, including transparent legacy Intel selection, and explicit manual `libx265`;
 - explicit backend requests for diagnostics or operator overrides;
 - required VMAF/SSIM quality or caller-disabled quality checks;
 - maximum-height scaling and optional denoise;
