@@ -21,6 +21,8 @@ def stream_counts(path: Path) -> dict[str, int]:
 
 def validate_output(source: Path, output: Path) -> None:
     if not output.is_file() or output.stat().st_size<=0:raise PlanError("HEVC execution produced no output file.")
+    if output.stat().st_size >= source.stat().st_size:
+        raise PlanError("HEVC execution rejected the result because it is not smaller than the source.")
     lines=command_output(["ffprobe","-v","error","-select_streams","V:0","-show_entries","stream=codec_name","-of","csv=p=0",str(output)]).splitlines();codec=lines[0].strip() if lines else ""
     if codec!="hevc":raise PlanError(f"Completed output codec was {codec or 'unreadable'}, not HEVC.")
     def duration(path:Path)->float:
