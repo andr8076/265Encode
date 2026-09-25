@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -16,7 +17,7 @@ SUPPORTED_PROTOCOLS = (2,)
 REQUIREMENTS_SCHEMA = "encode265.requirements"
 PLAN_SCHEMA = "encode265.plan"
 RESULT_SCHEMA = "encode265.plan-result"
-PLANNER_VERSION = "5"
+PLANNER_VERSION = "6"
 VMAF_PLANNING_MARGIN = 0.5
 DENOISE_FILTER = "hqdn3d=1.2:1.0:3.0:2.5"
 LEGACY_DENOISE_FILTER = "atadenoise"
@@ -292,6 +293,14 @@ def probe_source(path: Path) -> dict[str, Any]:
         raise PlanError("Input duration or dimensions could not be determined.")
     try: format_bitrate = max(0, int((data.get("format") or {}).get("bit_rate") or 0))
     except (TypeError, ValueError): format_bitrate = 0
+    pixel_format = str(primary.get("pix_fmt") or "")
+    try:
+        bit_depth = int(primary.get("bits_per_raw_sample") or 0)
+    except (TypeError, ValueError):
+        bit_depth = 0
+    if bit_depth <= 0:
+        match = re.search(r"([0-9]+)(?:le|be)?$", pixel_format)
+        bit_depth = int(match.group(1)) if match else 8
     copied_bitrate, audio_tracks = 0, []
     for item in streams:
         if item is primary: continue
@@ -300,16 +309,17 @@ def probe_source(path: Path) -> dict[str, Any]:
         copied_bitrate += bitrate
         if item.get("codec_type") == "audio":
             audio_tracks.append({"input_index": int(item.get("index") or 0), "codec": str(item.get("codec_name") or "unknown"), "channels": int(item.get("channels") or 2), "bitrate": bitrate})
-    return {"duration_seconds": duration, "width": width, "height": height, "codec": str(primary.get("codec_name") or ""), "primary_stream_index": int(primary.get("index") or 0), "streams": streams, "audio_tracks": audio_tracks, "format_bitrate": format_bitrate, "copied_stream_bitrate": copied_bitrate}
+    return {"duration_seconds": duration, "width": width, "height": height, "codec": str(primary.get("codec_name") or ""), "bit_depth": bit_depth, "pixel_format": pixel_format, "primary_stream_index": int(primary.get("index") or 0), "streams": streams, "audio_tracks": audio_tracks, "format_bitrate": format_bitrate, "copied_stream_bitrate": copied_bitrate}
 
 
 def capabilities(script: Path) -> dict[str, Any]:
     return json.loads(command_output([str(script), "--machine-probe"]))
 
 
-def choose_encoder(requirements: dict[str, Any], report: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+def choose_encoder(requirements: dict[str, Any], report: dict[str, Any], source: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
     encoders = {item.get("name"): item for item in report.get("encoders", []) if isinstance(item, dict)}
     requested, policy = requirements.get("requested_encoder"), requirements["hardware_policy"]
+    preserve_10bit = int(source.get("bit_depth") or 8) > 8
     if requested:
         chosen = encoders.get(requested)
         if not chosen or chosen.get("usable") is not True:
@@ -317,11 +327,21 @@ def choose_encoder(requirements: dict[str, Any], report: dict[str, Any]) -> tupl
         encoder_class = str(chosen.get("class") or "")
         if policy == "manual_software" and encoder_class != "software": raise PlanError("Requested encoder violates manual_software policy.")
         if policy == "auto_hardware_only" and encoder_class != "hardware": raise PlanError("Requested encoder violates auto_hardware_only policy.")
+        if preserve_10bit and chosen.get("supports_10bit") is not True:
+            raise PlanError(f"Requested HEVC encoder cannot preserve the source bit depth: {requested}")
         return requested, encoder_class, chosen
     if policy == "manual_software":
         chosen = encoders.get("libx265")
         if not chosen or chosen.get("usable") is not True: raise PlanError("Manual software encoding was requested, but libx265 is not usable.")
         return "libx265", "software", chosen
+    if preserve_10bit:
+        for name, chosen in encoders.items():
+            if chosen.get("class") == "hardware" and chosen.get("usable") is True and chosen.get("supports_10bit") is True:
+                return str(name), "hardware", chosen
+        chosen = encoders.get("libx265")
+        if chosen and chosen.get("usable") is True:
+            return "libx265", "software", chosen
+        raise PlanError("No usable encoder can preserve this source bit depth; libx265 is unavailable.")
     name, chosen = report.get("auto_encoder"), encoders.get(report.get("auto_encoder"))
     if not name or not chosen or chosen.get("usable") is not True or chosen.get("class") != "hardware": raise PlanError("No proven hardware HEVC encoder satisfies auto_hardware_only.")
     return str(name), "hardware", chosen

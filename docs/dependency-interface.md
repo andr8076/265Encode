@@ -99,8 +99,10 @@ recipe, predictions, and fingerprints. Consequently, a cache keyed by plan ID
 cannot reuse an old HEVC decision after 265Encode improves. Execution also
 rejects stale plans directly; cache discipline is not the only safeguard.
 
-`auto_hardware_only` never selects CPU encoding. `manual_software` is the only
-semantic request that permits `libx265`. Protocol 2 requires MKV and preserves
+`auto_hardware_only` prefers proven hardware. When the source is above 8-bit,
+AUTO selects 10-bit-capable hardware or uses `libx265` if no such hardware is
+available, preserving the source bit depth. `manual_software` explicitly selects
+`libx265` for any source. Protocol 2 requires MKV and preserves
 all streams, chapters, global metadata, and stream metadata. It supports
 maximum-height scaling, optional denoise, copied audio, and selective Opus audio
 optimization. Quality checks may be required or explicitly disabled by the
@@ -126,10 +128,10 @@ list. It reports these protocol-2 encoder identifiers:
 - `hevc_qsv`
 - `hevc_qsv_legacy` (isolated Intel Media SDK compatibility runtime)
 - `hevc_videotoolbox`
-- `libx265` (manual software only)
+- `libx265` (manual software, and AUTO fallback for source bit-depth preservation)
 
-`auto_encoder` is either a proven hardware encoder or `null`. Software is
-never AUTO-eligible. On supported Skylake/P530 systems, the legacy backend is
+`auto_encoder` is a proven hardware encoder or `null`. Capability records include
+`supports_10bit`; AUTO uses that field to choose a depth-preserving path. On supported Skylake/P530 systems, the legacy backend is
 automatically capability-probed and may be selected as `auto_encoder` after
 modern hardware paths fail. Its runtime, driver, and tuned recipe are sealed
 and fingerprinted by 265Encode. Callers must not download that runtime, choose

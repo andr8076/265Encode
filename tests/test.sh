@@ -26,18 +26,20 @@ value=json.load(sys.stdin)
 assert value["schema"] == "encode265.capabilities"
 assert value["supported_protocol_versions"] == [2]
 assert value["codec"] == "hevc"
-assert value["auto_policy"] == "hardware_only"
+assert value["auto_policy"] == "hardware_preferred_depth_preserving"
 features=value["features"]
 required={"semantic_planning","opaque_plan_id","fingerprint_invalidation",
 "sampled_predictions","semantic_requested_encoder","semantic_quality_off",
           "semantic_scaling","semantic_denoise","semantic_audio_optimize",
-          "preserve_all","full_decode_validation"}
+          "preserve_all","full_decode_validation","bit_depth_preservation_fallback"}
 assert all(features.get(name) is True for name in required)
 records={item["name"]:item for item in value["encoders"]}
 assert records["libx265"]["class"] == "software"
 assert records["libx265"]["auto_eligible"] is False
 assert records["hevc_qsv_legacy"]["class"] == "hardware"
 assert records["hevc_qsv_legacy"]["auto_eligible"] is True
+assert records["hevc_qsv_legacy"]["supports_10bit"] is False
+assert records["libx265"]["supports_10bit"] is True
 auto=value["auto_encoder"]
 assert auto is None or (
     records[auto]["class"] == "hardware" and records[auto]["usable"] is True

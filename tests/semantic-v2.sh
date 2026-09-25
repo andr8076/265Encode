@@ -180,11 +180,16 @@ from hevcplan_contract import _legacy_filter_available, choose_encoder, encoder_
 from hevcplan_quality import software_filter, video_encode_args
 req={'hardware_policy':'auto_hardware_only','requested_encoder':'hevc_nvenc'}
 report={'auto_encoder':'hevc_qsv','encoders':[{'name':'hevc_nvenc','usable':True,'class':'hardware'},{'name':'hevc_qsv','usable':True,'class':'hardware'}]}
-assert choose_encoder(req, report)[:2] == ('hevc_nvenc','hardware')
+assert choose_encoder(req, report, {'bit_depth':8})[:2] == ('hevc_nvenc','hardware')
 req={'hardware_policy':'auto_hardware_only','requested_encoder':None}
-legacy={'name':'hevc_qsv_legacy','usable':True,'class':'hardware'}
-report={'auto_encoder':'hevc_qsv_legacy','encoders':[legacy]}
-assert choose_encoder(req, report) == ('hevc_qsv_legacy','hardware',legacy)
+legacy={'name':'hevc_qsv_legacy','usable':True,'class':'hardware','supports_10bit':False}
+software={'name':'libx265','usable':True,'class':'software','supports_10bit':True}
+report={'auto_encoder':'hevc_qsv_legacy','encoders':[legacy,software]}
+assert choose_encoder(req, report, {'bit_depth':8}) == ('hevc_qsv_legacy','hardware',legacy)
+assert choose_encoder(req, report, {'bit_depth':10}) == ('libx265','software',software)
+modern={'name':'hevc_qsv','usable':True,'class':'hardware','supports_10bit':True}
+report['encoders'].insert(0,modern)
+assert choose_encoder(req, report, {'bit_depth':10}) == ('hevc_qsv','hardware',modern)
 recipe={
     'encoder':'hevc_qsv_legacy',
     'quality':{'kind':'qp','value':19,'preset':'legacy-safe-v1'},

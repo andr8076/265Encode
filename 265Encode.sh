@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # 265Encode 3.2.0.
-# Hardware HEVC encoding is capability-proven and hardware-only in AUTO.
+# Hardware HEVC is preferred in AUTO; source bit depth is preserved when possible.
 # Protocol 2 exposes semantic requirements, sealed plans, fingerprints,
 # predictions, preservation, and validated atomic execution to dependent tools.
 # The interactive and command-line batch encoder remains independently usable.
@@ -59,9 +59,9 @@ Usage:
   $SCRIPT_NAME [options] FILE_OR_FOLDER
   $SCRIPT_NAME [options] --input FILE_OR_FOLDER
 
-With no arguments, the script uses the original interactive menus and selects
-only a capability-proven hardware HEVC encoder. Software encoding always
-requires an explicit --software request.
+With no arguments, the script uses the original interactive menus and prefers
+capability-proven hardware HEVC. AUTO preserves source bit depth, using software
+when no 10-bit hardware encoder is available for a higher-bit-depth source.
 With command-line arguments, it runs non-interactively unless --interactive
 or --confirm is supplied.
 
@@ -76,7 +76,7 @@ Input and traversal:
 
 Encoding:
   -m, --mode MODE          auto, software, or hardware
-      --auto               Automatically select a working hardware encoder
+      --auto               Prefer hardware; preserve source bit depth when needed
       --software           Explicitly allow libx265 CPU encoding
       --size-focused       Explicitly use CPU libx265, calibrate per file
                            to save size while meeting source-relative VMAF floors
@@ -122,8 +122,9 @@ Dependency interface:
       --version            Show the script version
 
 Command-line defaults:
-  mode=auto (hardware only), recursive=no, common extensions, process HEVC, AAC 192k,
-  container=mp4, and skip existing output files.
+  mode=auto (hardware preferred; source bit depth preserved), recursive=no,
+  common extensions, process HEVC, AAC 192k,
+  container=mp4, and skip existing output files; AUTO preserves source bit depth.
 
 Examples:
   $SCRIPT_NAME --hardware --skip-hevc "movie.mkv"
@@ -985,10 +986,18 @@ machine_probe_encoder() {
 
 machine_encoder_json() {
     local name="$1" class="$2" advertised="$3" usable="$4" detail="$5"
-    printf '{"name":%s,"class":%s,"auto_eligible":%s,"advertised":%s,"usable":%s,"detail":%s' \
+    local supports_10bit=false
+    if [[ "$usable" == true ]]; then
+        case "$name" in
+            hevc_qsv_legacy) supports_10bit=false ;;
+            hevc_vaapi) [[ "$VAAPI_BIT_DEPTH" == "10-bit" ]] && supports_10bit=true ;;
+            *) supports_10bit=true ;;
+        esac
+    fi
+    printf '{"name":%s,"class":%s,"auto_eligible":%s,"advertised":%s,"usable":%s,"supports_10bit":%s,"detail":%s' \
         "$(json_string "$name")" "$(json_string "$class")" \
         "$([[ $class == hardware ]] && printf true || printf false)" \
-        "$advertised" "$usable" "$(json_string "$detail")"
+        "$advertised" "$usable" "$supports_10bit" "$(json_string "$detail")"
     if [[ $name == hevc_qsv_legacy && $usable == true ]]; then
         printf ',"runtime":{"ffmpeg":%s,"ffprobe":%s,"manifest":%s,"driver_dir":%s}' \
             "$(json_string "${ENCODE265_LEGACY_RUNTIME}/bin/ffmpeg")" \
@@ -1018,8 +1027,8 @@ show_machine_capabilities() {
     printf '{"schema":"encode265.capabilities","protocol_version":2,'
     printf '"tool":{"name":"265Encode","version":%s},' "$(json_string "$SCRIPT_VERSION")"
     printf '"supported_protocol_versions":[2],'
-    printf '"codec":"hevc","auto_policy":"hardware_only","ffmpeg":%s,' "$(json_string "$ffmpeg_version")"
-    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true,"semantic_planning":true,"opaque_plan_id":true,"fingerprint_invalidation":true,"sampled_predictions":true,"semantic_requested_encoder":true,"semantic_quality_off":true,"semantic_scaling":true,"semantic_denoise":true,"semantic_audio_optimize":true,"legacy_intel_protocol2":true,"legacy_intel_auto_transparent":true},'
+    printf '"codec":"hevc","auto_policy":"hardware_preferred_depth_preserving","ffmpeg":%s,' "$(json_string "$ffmpeg_version")"
+    printf '"features":{"exact_output":true,"atomic_result":true,"preserve_all":true,"full_decode_validation":true,"semantic_planning":true,"opaque_plan_id":true,"fingerprint_invalidation":true,"sampled_predictions":true,"semantic_requested_encoder":true,"semantic_quality_off":true,"semantic_scaling":true,"semantic_denoise":true,"semantic_audio_optimize":true,"bit_depth_preservation_fallback":true,"legacy_intel_protocol2":true,"legacy_intel_auto_transparent":true},'
     if [[ -n $auto_encoder ]]; then
         printf '"auto_encoder":%s,' "$(json_string "$auto_encoder")"
     else
@@ -1239,13 +1248,18 @@ configure_encoder() {
 
     detect_hw
 
+    if [[ "$selected_mode" == "auto" && "$HW_TYPE" == "none" ]]; then
+        ACTIVE_MODE="pending"
+        ACTIVE_ENCODER="Awaiting source bit depth"
+        return
+    fi
+
     if [[ "$selected_mode" == "auto" ]]; then
         selected_mode="hardware"
     fi
 
     if [[ "$selected_mode" == "hardware" && "$HW_TYPE" == "none" ]]; then
         error "No capability-proven HEVC hardware encoder is available."
-        echo "AUTO never selects CPU encoding; use --software to explicitly allow libx265." >&2
         exit 1
     fi
 
@@ -1328,15 +1342,15 @@ analyze_video() {
     local current_codec
     local current_width
     local current_height
-    local current_sar
+    local current_sar current_pix_fmt current_bits_raw
 
     video_info="$(ffprobe -v error \
         -select_streams v:0 \
-        -show_entries stream=codec_name,width,height,sample_aspect_ratio \
+        -show_entries stream=codec_name,width,height,sample_aspect_ratio,pix_fmt,bits_per_raw_sample \
         -of csv=p=0 \
         "$input_file")"
 
-    IFS=',' read -r current_codec current_width current_height current_sar <<< "$video_info"
+    IFS=',' read -r current_codec current_width current_height current_sar current_pix_fmt current_bits_raw <<< "$video_info"
 
     if [[ -z "$current_codec" || ! "$current_width" =~ ^[0-9]+$ ||
           ! "$current_height" =~ ^[0-9]+$ ]]; then
@@ -1352,10 +1366,18 @@ analyze_video() {
     INPUT_VIDEO_WIDTH="$current_width"
     INPUT_VIDEO_HEIGHT="$current_height"
     INPUT_VIDEO_SAR="$current_sar"
+    if [[ "$current_bits_raw" =~ ^[0-9]+$ && $current_bits_raw -gt 0 ]]; then
+        INPUT_VIDEO_BIT_DEPTH="$current_bits_raw"
+    elif [[ "$current_pix_fmt" =~ ([0-9]+)(le|be)?$ ]]; then
+        INPUT_VIDEO_BIT_DEPTH=$((10#${BASH_REMATCH[1]}))
+    else
+        INPUT_VIDEO_BIT_DEPTH=8
+    fi
 
     echo "Codec:      $current_codec"
     echo "Resolution: ${current_width}x${current_height}"
     echo "Pixel SAR:  $current_sar"
+    echo "Bit depth:  ${INPUT_VIDEO_BIT_DEPTH}-bit"
 
     if [[ "$current_codec" == "hevc" ]]; then
         echo "Warning: already H.265/HEVC."
@@ -1517,6 +1539,7 @@ encode_file() {
     local overwrite_answer
     local output_args=()
     local command=()
+    local requested_mode="$MODE"
 
     VIDEO_OUTPUT_ARGS=()
 
@@ -1547,6 +1570,27 @@ encode_file() {
     analyze_video "$input_file" || return 0
     if [[ "$SIZE_FOCUSED_MODE" == "yes" ]]; then
         if ! configure_size_focused_software_file "$input_file"; then
+            return 1
+        fi
+    fi
+
+    # Restore AUTO hardware after a prior file used the CPU depth fallback.
+    if [[ "$MODE" == "auto" && "$ACTIVE_MODE" == "software" ]]; then
+        configure_encoder
+    fi
+    if [[ "$MODE" != "software" ]]; then
+        local hardware_supports_10bit="yes"
+        case "$HW_TYPE" in
+            none|intel-legacy) hardware_supports_10bit="no" ;;
+            vaapi) [[ "$VAAPI_BIT_DEPTH" == "10-bit" ]] || hardware_supports_10bit="no" ;;
+        esac
+        if [[ "$INPUT_VIDEO_BIT_DEPTH" -gt 8 && "$hardware_supports_10bit" == "no" ]]; then
+            echo "Available hardware cannot preserve ${INPUT_VIDEO_BIT_DEPTH}-bit video; using CPU libx265 at 10-bit."
+            MODE="software"
+            configure_encoder
+            MODE="$requested_mode"
+        elif [[ "$HW_TYPE" == "none" ]]; then
+            error "No capability-proven HEVC hardware encoder is available for this source."
             return 1
         fi
     fi
@@ -1680,8 +1724,13 @@ show_plan() {
     echo "=========================================="
     echo "Input:       $INPUT_PATH"
     echo "Files:       ${#FILES[@]}"
-    echo "Mode:        $ACTIVE_MODE"
-    echo "Encoder:     $ACTIVE_ENCODER"
+    if [[ "$MODE" == "auto" ]]; then
+        echo "Mode:        AUTO (source-depth aware)"
+        echo "Preferred:   ${ACTIVE_ENCODER}"
+    else
+        echo "Mode:        $ACTIVE_MODE"
+        echo "Encoder:     $ACTIVE_ENCODER"
+    fi
     echo "Container:   $OUTPUT_EXTENSION"
     if [[ "$AUDIO_MODE" == "aac" ]]; then
         echo "Audio:       AAC ${AUDIO_BITRATE}"
