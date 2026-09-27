@@ -6,6 +6,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 bash -n "$ROOT/265Encode.sh" "$ROOT/tools/legacy-intel.sh"
 python3 -m py_compile \
     "$ROOT/tools/265Compare.py" \
+    "$ROOT/tools/265Analyze.py" \
     "$ROOT/tools/software-size-calibration.py" \
     "$ROOT/tools/HEVCPlan.py" \
     "$ROOT/tools/hevcplan_contract.py" \
@@ -68,5 +69,6 @@ PY
 python3 -m json.tool "$ROOT/docs/requirements-v2.schema.json" >/dev/null
 python3 "$ROOT/tools/test_legacy_intel_calibration.py"
 python3 "$ROOT/tests/test_size_guard.py"
+python3 "$ROOT/tests/test_analyze.py"
 bash "$ROOT/tests/semantic-v2.sh"
 printf '265Encode policy and protocol tests passed.\n'

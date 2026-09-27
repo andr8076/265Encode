@@ -30,6 +30,34 @@ software for any source:
 
 Use `./265Encode.sh --help` for traversal, audio, container, overwrite, and
 legacy Intel options.
+
+## Analyze a video before encoding
+
+```bash
+./265Encode.sh --analyze "movie.mkv"
+./265Encode.sh --analyze "movie.mkv" --plan-json movie.plan.json --report-json movie.analysis.json
+./265Encode.sh --execute-plan movie.plan.json --result-json movie.result.json
+```
+
+Analysis tests representative clips at the beginning, middle, and end of the
+video. It searches quality values for the proven hardware AUTO path and CPU
+`libx265`, measures VMAF against the original, and estimates their completed
+sizes including the copied streams. The recommendation is the smallest tested
+candidate that clears the mean, low-percentile, and sustained-dip quality
+limits and predicts at least 3% whole-file savings. It recommends keeping the
+source otherwise. The original resolution, all streams, chapters, and metadata
+are preserved by default. No output video is made during analysis.
+
+Use `--analyze "movie.mkv" --encode` to run the selected sealed plan directly.
+The completed output is validated and rejected if it is not smaller than the
+original. Analysis estimates come from short clips and are not guarantees for
+the entire video. The first VMAF run may download 265Encode's verified quality
+runtime when your installed FFmpeg lacks `libvmaf`. `--analyze --help` lists
+quality thresholds, optional audio optimization, and JSON report options.
+
+For a local diagnostic when VMAF is unavailable, `--metric ssim_percent`
+measures mean SSIM only; its score and thresholds are not interchangeable with
+VMAF or its low-frame checks.
 ## Hardware policy
 
 Modern backends are tested with bounded real encodes:

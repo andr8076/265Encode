@@ -16,7 +16,7 @@ HARDWARE_PROBE_SIZE="256x256"
 LEGACY_INTEL_HELPER_URL="https://raw.githubusercontent.com/andr8076/265Encode/main/tools/legacy-intel.sh"
 LEGACY_INTEL_HELPER_SHA256="cc6138e22f2fe22834e99ace011d8ae1fa8a021e7f5e1cbb281596f514756c38"
 LEGACY_INTEL_CALIBRATOR_URL="https://raw.githubusercontent.com/andr8076/265Encode/main/tools/legacy-intel-calibration.py"
-LEGACY_INTEL_CALIBRATOR_SHA256="566fd0a66f78cafb9e8ec538eb4ba9d1d9a508eac9ec5f166fc5be8de317f45d"
+LEGACY_INTEL_CALIBRATOR_SHA256="faeb5814757c2373b98801b8d9845de52999ed032ba6494f36850fdeffb287dd"
 LEGACY_INTEL_DEVICE_ID=""
 LEGACY_INTEL_ADDON_LOADED="no"
 LEGACY_INTEL_FFMPEG_COMMAND=()
@@ -109,6 +109,8 @@ Operation:
       --no-legacy-intel    Disable optional legacy Intel fallback for this run
 
 Dependency interface:
+      --analyze FILE      Test HEVC compression and visual quality on samples
+                           (see --analyze --help for tuning and JSON options)
       --machine-probe      Print versioned encoder capability JSON and exit
       --interface-version Print the newest machine-interface version and exit
       --machine-negotiate VERSIONS
@@ -1754,6 +1756,14 @@ dispatch_dependency_interface() {
     planner="$script_dir/tools/HEVCPlan.py"
 
     case "${1-}" in
+        --analyze)
+            command -v python3 >/dev/null 2>&1 || {
+                error "python3 is required for analysis."
+                exit 1
+            }
+            shift
+            exec python3 "$script_dir/tools/265Analyze.py" "$@"
+            ;;
         --interface-version)
             (( $# == 1 )) || { error "Usage: $SCRIPT_NAME --interface-version"; exit 2; }
             printf '%s\n' "$LATEST_MACHINE_INTERFACE_VERSION"
