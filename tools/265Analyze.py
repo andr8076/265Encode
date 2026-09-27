@@ -163,7 +163,10 @@ def run_folder(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
                 if learned is not None:
                     source_info = probe_source(source)
                     compatible = ("codec", "bit_depth", "pixel_format")
-                    if any(source_info[key] != selected_source[key] for key in compatible):
+                    if any(stream.get("codec_type") == "data" for stream in source_info["streams"]):
+                        entry["status"] = "skipped_incompatible"
+                        entry["error"] = "Source has a data stream that Matroska cannot preserve."
+                    elif any(source_info[key] != selected_source[key] for key in compatible):
                         entry["status"] = "skipped_incompatible"
                         entry["error"] = "Video codec, bit depth, or pixel format differs from representative."
                     else:
