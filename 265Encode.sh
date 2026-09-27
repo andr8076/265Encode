@@ -112,6 +112,8 @@ Dependency interface:
       --analyze FILE_OR_FOLDER
                            Test HEVC compression and visual quality on samples
                            Add --encode to convert each qualifying file
+                           Use --learn-from FILE with a folder to analyze once
+                           and reuse its settings for the batch
                            (see --analyze --help for tuning and JSON options)
       --machine-probe      Print versioned encoder capability JSON and exit
       --interface-version Print the newest machine-interface version and exit

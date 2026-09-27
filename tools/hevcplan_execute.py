@@ -52,6 +52,11 @@ def execute_direct(requirements: dict[str,Any], recipe: dict[str,Any], source: d
     video_partial=output.with_name(f".{output.name}.encode265-video-{os.getpid()}.mkv")
     primary=int(source["primary_stream_index"])
     others=[int(x.get("index") or 0) for x in source["streams"] if int(x.get("index") or 0)!=primary]
+    # MP4 timed text cannot be copied into Matroska. Keep the subtitle stream as SubRip.
+    subtitle_args=["-c:s", "srt"] if any(
+        x.get("codec_type") == "subtitle" and x.get("codec_name") == "mov_text"
+        for x in source["streams"]
+    ) else []
     try:
         partial.unlink(missing_ok=True);video_partial.unlink(missing_ok=True)
         global_args,video_args=video_encode_args(recipe["encoder"],recipe)
@@ -63,12 +68,12 @@ def execute_direct(requirements: dict[str,Any], recipe: dict[str,Any], source: d
             host_ffmpeg,host_environment=encoder_runtime({"encoder":"host_mux"})
             command=[host_ffmpeg,"-hide_banner","-loglevel","error","-y","-i",str(video_partial),"-i",requirements["input"],"-map","0:v:0"]
             for index in others:command += ["-map",f"1:{index}"]
-            command += ["-map_metadata","1","-map_chapters","1","-copy_unknown","-c","copy",*_audio_args(recipe),"-max_muxing_queue_size","4096",str(partial)]
+            command += ["-map_metadata","1","-map_chapters","1","-copy_unknown","-c","copy",*_audio_args(recipe),*subtitle_args,"-max_muxing_queue_size","4096",str(partial)]
             environment=host_environment
         else:
             command=[ffmpeg,"-hide_banner","-loglevel","error","-y",*global_args,"-i",requirements["input"],"-map",f"0:{primary}"]
             for index in others:command += ["-map",f"0:{index}"]
-            command += ["-map_metadata","0","-map_chapters","0","-copy_unknown","-c","copy",*video_args,*_audio_args(recipe),"-max_muxing_queue_size","4096",str(partial)]
+            command += ["-map_metadata","0","-map_chapters","0","-copy_unknown","-c","copy",*video_args,*_audio_args(recipe),*subtitle_args,"-max_muxing_queue_size","4096",str(partial)]
         process=subprocess.run(command,env=environment,text=True,capture_output=True,check=False)
         if process.returncode!=0:raise PlanError(process.stderr.strip() or "HEVC mux/audio execution failed.")
         validate_output(Path(requirements["input"]),partial);os.replace(partial,output)
