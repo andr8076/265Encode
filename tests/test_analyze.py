@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,36 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(codec, "hevc")
             self.assertLess(output.stat().st_size, source.stat().st_size)
             self.assertEqual(original_bytes, source.read_bytes())
+
+    def test_folder_analyzes_each_video_and_skips_existing_outputs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="265analyze-batch-") as raw:
+            folder = Path(raw)
+            nested = folder / "nested"
+            nested.mkdir()
+            source = folder / "one.mkv"
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12:duration=2",
+                "-c:v", "ffv1", str(source),
+            ], check=True)
+            other = nested / "two.mkv"
+            shutil.copy2(source, other)
+            original = source.read_bytes()
+            report = folder / "batch.json"
+            command = [str(SCRIPT), "--analyze", str(folder), "--recursive",
+                       "--mode", "software", "--metric", "ssim_percent",
+                       "--target-vmaf", "75", "--p10-minimum", "70",
+                       "--sustained-floor", "65", "--sample-seconds", "1", "--encode"]
+            subprocess.run([*command, "--report-json", str(report)], check=True,
+                           capture_output=True, text=True)
+            result = json.loads(report.read_text())
+            self.assertEqual(result["summary"]["encoded"], 2)
+            self.assertTrue((folder / "one.hevc.mkv").is_file())
+            self.assertTrue((nested / "two.hevc.mkv").is_file())
+            self.assertEqual(source.read_bytes(), original)
+            self.assertEqual(other.read_bytes(), original)
+            second = subprocess.run(command, check=True, capture_output=True, text=True)
+            self.assertIn("2 skipped_existing", second.stdout)
 
 
 if __name__ == "__main__":
