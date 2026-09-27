@@ -100,5 +100,31 @@ class SelectionTests(unittest.TestCase):
             self.assertIn("2 skipped_existing", second.stdout)
 
 
+    def test_learn_once_batch_reuses_quality_without_evaluating_each_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="265analyze-learn-") as raw:
+            folder = Path(raw)
+            first, second = folder / "one.mkv", folder / "two.mkv"
+            subprocess.run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12:duration=2",
+                "-c:v", "ffv1", str(first),
+            ], check=True)
+            shutil.copy2(first, second)
+            report = folder / "batch.json"
+            run = subprocess.run([
+                str(SCRIPT), "--analyze", str(folder), "--learn-from", str(first),
+                "--mode", "software", "--metric", "ssim_percent", "--target-vmaf", "75",
+                "--p10-minimum", "70", "--sustained-floor", "65",
+                "--sample-seconds", "1", "--encode", "--report-json", str(report),
+            ], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            result = json.loads(report.read_text())
+            self.assertEqual(result["summary"]["encoded"], 2, run.stdout)
+            self.assertEqual(result["representative"]["input"], str(first))
+            self.assertTrue(all("analysis" not in entry for entry in result["files"]))
+            self.assertTrue((folder / "one.hevc.mkv").is_file())
+            self.assertTrue((folder / "two.hevc.mkv").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

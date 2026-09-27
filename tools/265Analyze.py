@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from HEVCPlan import evaluate, execute
-from hevcplan_contract import PlanError, atomic_json, probe_source
+from hevcplan_contract import PlanError, atomic_json, capabilities, choose_encoder, probe_source, recipe_for
+from hevcplan_execute import execute_direct
 
 
 def parser() -> argparse.ArgumentParser:
@@ -20,6 +21,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--output", type=Path, help="Proposed .mkv output for one video (default: INPUT.hevc.mkv)")
     p.add_argument("--output-dir", type=Path, help="Folder for batch outputs; preserves subfolders with --recursive")
     p.add_argument("--recursive", action="store_true", help="Include videos in subfolders")
+    p.add_argument("--learn-from", type=Path, help="Analyze this one representative video, then reuse its settings for the folder")
     p.add_argument("--mode", choices=("both", "auto", "software"), default="both", help="Compare proven hardware AUTO and CPU libx265 (default: both)")
     p.add_argument("--target-vmaf", type=float, default=93.0, help="Minimum mean VMAF in every sample (default: 93)")
     p.add_argument("--p10-minimum", type=float, default=88.0, help="Minimum tenth percentile VMAF (default: 88)")
@@ -59,6 +61,8 @@ def check_arguments(args: argparse.Namespace) -> tuple[Path, Path]:
         raise PlanError(f"Input is not a file: {source}")
     if args.recursive:
         raise PlanError("--recursive is only valid for a folder.")
+    if args.learn_from is not None:
+        raise PlanError("--learn-from is only valid for a folder.")
     if args.output_dir is not None:
         raise PlanError("--output-dir is only valid for a folder.")
     output = (args.output or source.with_name(source.stem + ".hevc.mkv")).expanduser().resolve()
@@ -103,13 +107,42 @@ def run_folder(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
         report_path = args.report_json.expanduser().resolve()
         if not report_path.parent.is_dir() or report_path.exists():
             raise PlanError(f"Report directory must exist and report must be new: {report_path}")
+    report: dict[str, Any] = {"schema": "encode265.batch-analysis", "input_folder": str(folder),
+                              "output_folder": str(destination), "recursive": args.recursive,
+                              "metric": args.metric, "files": [], "summary": {}}
+    learned = None
+    if args.learn_from is not None:
+        representative = args.learn_from.expanduser().resolve()
+        if (not representative.is_file() or not representative.is_relative_to(folder)
+                or representative.suffix.lower() not in VIDEO_EXTENSIONS
+                or representative.name.lower().endswith(".hevc.mkv")):
+            raise PlanError("--learn-from must name a source video inside the input folder.")
+        single = argparse.Namespace(**vars(args))
+        single.input = representative
+        single.output_dir = single.learn_from = single.report_json = single.plan_json = None
+        single.recursive = single.encode = False
+        # The representative may already have an output when a batch is resumed.
+        with tempfile.TemporaryDirectory(prefix="265encode-learn-") as sample_dir:
+            single.output = Path(sample_dir) / "representative.hevc.mkv"
+            sample_report, selected = analyze(single)
+        sample_report["output"] = str(destination / representative.relative_to(folder).parent /
+                                      (representative.stem + ".hevc.mkv"))
+        report["representative"] = sample_report
+        if selected is None:
+            report["summary"] = {"encoded": 0, "recommended": 0, "kept_source": 0,
+                                 "skipped_existing": 0, "skipped_incompatible": 0, "failed": 0}
+            if args.report_json is not None:
+                atomic_json(args.report_json.expanduser().resolve(), report)
+            print("Representative did not qualify for encoding; no folder files were changed.", flush=True)
+            return report, False
+        learned = selected["plan"]
+        selected_source = probe_source(representative)
+        capability_report = capabilities(Path(__file__).resolve().parent.parent / "265Encode.sh")
+        print(f"Learned {learned['selection']['encoder']} {learned['recipe']['quality']} from {representative}", flush=True)
     paths = folder.rglob("*") if args.recursive else folder.iterdir()
     sources = sorted((path for path in paths if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
                       and not path.name.lower().endswith(".hevc.mkv")), key=lambda p: str(p))
     output_names = Counter((source.parent, source.stem.casefold()) for source in sources)
-    report: dict[str, Any] = {"schema": "encode265.batch-analysis", "input_folder": str(folder),
-                              "output_folder": str(destination), "recursive": args.recursive,
-                              "metric": args.metric, "files": [], "summary": {}}
     failures = False
     print(f"Analyzing {len(sources)} video(s) in {folder}", flush=True)
     for index, source in enumerate(sources, 1):
@@ -127,6 +160,38 @@ def run_folder(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
                 single.input, single.output = source, output
                 single.output_dir, single.recursive = None, False
                 single.report_json, single.plan_json = None, None
+                if learned is not None:
+                    source_info = probe_source(source)
+                    compatible = ("codec", "bit_depth", "pixel_format")
+                    if any(source_info[key] != selected_source[key] for key in compatible):
+                        entry["status"] = "skipped_incompatible"
+                        entry["error"] = "Video codec, bit depth, or pixel format differs from representative."
+                    else:
+                        requirements_copy = requirements(single, source, output,
+                                                         "software" if learned["selection"]["class"] == "software" else "auto")
+                        encoder, _, capability = choose_encoder(requirements_copy, capability_report, source_info)
+                        if encoder != learned["selection"]["encoder"]:
+                            entry["status"] = "skipped_incompatible"
+                            entry["error"] = "Selected encoder differs from representative."
+                        else:
+                            recipe = recipe_for(encoder, requirements_copy, source_info, capability)
+                            if recipe["denoise"] != learned["recipe"]["denoise"]:
+                                entry["status"] = "skipped_incompatible"
+                                entry["error"] = "Video filter differs from representative."
+                            else:
+                                recipe["quality"] = learned["recipe"]["quality"].copy()
+                                if args.encode:
+                                    execute_direct(requirements_copy, recipe, source_info)
+                                    entry["status"] = "encoded"
+                                else:
+                                    entry["status"] = "recommended"
+                                entry["encoder"] = encoder
+                                entry["learned_from"] = str(representative)
+                    report["files"].append(entry)
+                    failures |= entry["status"] == "failed"
+                    detail = f" ({entry['error']})" if entry.get("error") else ""
+                    print(f"[{index}/{len(sources)}] {relative}: {entry['status']}{detail}", flush=True)
+                    continue
                 result, _ = analyze(single)
                 entry["analysis"] = result
                 if result["recommendation"] == "keep_source":
@@ -145,7 +210,7 @@ def run_folder(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
         detail = f" ({entry['error']})" if entry["status"] == "failed" else ""
         print(f"[{index}/{len(sources)}] {relative}: {entry['status']}{detail}", flush=True)
     report["summary"] = {status: sum(item["status"] == status for item in report["files"])
-                         for status in ("encoded", "recommended", "kept_source", "skipped_existing", "failed")}
+                         for status in ("encoded", "recommended", "kept_source", "skipped_existing", "skipped_incompatible", "failed")}
     if args.report_json is not None:
         atomic_json(args.report_json.expanduser().resolve(), report)
     print("Batch summary: " + ", ".join(f"{number} {status}" for status, number in report["summary"].items() if number))
