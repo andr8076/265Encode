@@ -109,6 +109,8 @@ Operation:
       --no-legacy-intel    Disable optional legacy Intel fallback for this run
 
 Dependency interface:
+      --analyze FILE      Test HEVC compression and visual quality on samples
+                           (see --analyze --help for tuning and JSON options)
       --machine-probe      Print versioned encoder capability JSON and exit
       --interface-version Print the newest machine-interface version and exit
       --machine-negotiate VERSIONS
@@ -1754,6 +1756,14 @@ dispatch_dependency_interface() {
     planner="$script_dir/tools/HEVCPlan.py"
 
     case "${1-}" in
+        --analyze)
+            command -v python3 >/dev/null 2>&1 || {
+                error "python3 is required for analysis."
+                exit 1
+            }
+            shift
+            exec python3 "$script_dir/tools/265Analyze.py" "$@"
+            ;;
         --interface-version)
             (( $# == 1 )) || { error "Usage: $SCRIPT_NAME --interface-version"; exit 2; }
             printf '%s\n' "$LATEST_MACHINE_INTERFACE_VERSION"
