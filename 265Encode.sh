@@ -109,7 +109,9 @@ Operation:
       --no-legacy-intel    Disable optional legacy Intel fallback for this run
 
 Dependency interface:
-      --analyze FILE      Test HEVC compression and visual quality on samples
+      --analyze FILE_OR_FOLDER
+                           Test HEVC compression and visual quality on samples
+                           Add --encode to convert each qualifying file
                            (see --analyze --help for tuning and JSON options)
       --machine-probe      Print versioned encoder capability JSON and exit
       --interface-version Print the newest machine-interface version and exit

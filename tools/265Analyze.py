@@ -6,6 +6,7 @@ import argparse
 import math
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +16,10 @@ from hevcplan_contract import PlanError, atomic_json, probe_source
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Measure representative HEVC samples and recommend the smallest quality-qualified output.")
-    p.add_argument("input", type=Path, help="Video to analyze")
-    p.add_argument("--output", type=Path, help="Proposed .mkv output (default: INPUT.hevc.mkv)")
+    p.add_argument("input", type=Path, help="Video or folder to analyze")
+    p.add_argument("--output", type=Path, help="Proposed .mkv output for one video (default: INPUT.hevc.mkv)")
+    p.add_argument("--output-dir", type=Path, help="Folder for batch outputs; preserves subfolders with --recursive")
+    p.add_argument("--recursive", action="store_true", help="Include videos in subfolders")
     p.add_argument("--mode", choices=("both", "auto", "software"), default="both", help="Compare proven hardware AUTO and CPU libx265 (default: both)")
     p.add_argument("--target-vmaf", type=float, default=93.0, help="Minimum mean VMAF in every sample (default: 93)")
     p.add_argument("--p10-minimum", type=float, default=88.0, help="Minimum tenth percentile VMAF (default: 88)")
@@ -54,6 +57,10 @@ def check_arguments(args: argparse.Namespace) -> tuple[Path, Path]:
     source = args.input.expanduser().resolve()
     if not source.is_file():
         raise PlanError(f"Input is not a file: {source}")
+    if args.recursive:
+        raise PlanError("--recursive is only valid for a folder.")
+    if args.output_dir is not None:
+        raise PlanError("--output-dir is only valid for a folder.")
     output = (args.output or source.with_name(source.stem + ".hevc.mkv")).expanduser().resolve()
     if output == source or output.suffix.lower() != ".mkv" or not output.parent.is_dir():
         raise PlanError("Output must be a separate .mkv path in an existing directory.")
@@ -80,6 +87,69 @@ def check_arguments(args: argparse.Namespace) -> tuple[Path, Path]:
         if path.exists():
             raise PlanError(f"Analysis file already exists: {path}")
     return source, output
+
+
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".mts", ".m2ts", ".wmv", ".flv"}
+
+
+def run_folder(args: argparse.Namespace) -> tuple[dict[str, Any], bool]:
+    folder = args.input.expanduser().resolve()
+    if args.output is not None or args.plan_json is not None:
+        raise PlanError("For a folder, use --output-dir and --report-json; --output and --plan-json are for one video.")
+    destination = (args.output_dir or folder).expanduser().resolve()
+    if not destination.is_dir():
+        raise PlanError(f"Output folder does not exist: {destination}")
+    if args.report_json is not None:
+        report_path = args.report_json.expanduser().resolve()
+        if not report_path.parent.is_dir() or report_path.exists():
+            raise PlanError(f"Report directory must exist and report must be new: {report_path}")
+    paths = folder.rglob("*") if args.recursive else folder.iterdir()
+    sources = sorted((path for path in paths if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+                      and not path.name.lower().endswith(".hevc.mkv")), key=lambda p: str(p))
+    output_names = Counter((source.parent, source.stem.casefold()) for source in sources)
+    report: dict[str, Any] = {"schema": "encode265.batch-analysis", "input_folder": str(folder),
+                              "output_folder": str(destination), "recursive": args.recursive,
+                              "metric": args.metric, "files": [], "summary": {}}
+    failures = False
+    print(f"Analyzing {len(sources)} video(s) in {folder}", flush=True)
+    for index, source in enumerate(sources, 1):
+        relative = source.relative_to(folder)
+        name = source.name if output_names[(source.parent, source.stem.casefold())] > 1 else source.stem
+        output = destination / relative.parent / f"{name}.hevc.mkv"
+        entry: dict[str, Any] = {"input": str(source), "output": str(output)}
+        if output.exists():
+            entry["status"] = "skipped_existing"
+        else:
+            try:
+                # The output tree is created only for files being analyzed.
+                output.parent.mkdir(parents=True, exist_ok=True)
+                single = argparse.Namespace(**vars(args))
+                single.input, single.output = source, output
+                single.output_dir, single.recursive = None, False
+                single.report_json, single.plan_json = None, None
+                result, _ = analyze(single)
+                entry["analysis"] = result
+                if result["recommendation"] == "keep_source":
+                    if all(candidate["reason"] == "evaluation_failed" for candidate in result["candidates"]):
+                        entry["status"] = "failed"
+                        entry["error"] = "No encoder could complete sample evaluation."
+                    else:
+                        entry["status"] = "kept_source"
+                else:
+                    entry["status"] = "encoded" if args.encode else "recommended"
+                    entry["encoder"] = result["selected_encoder"]
+            except (PlanError, OSError, RuntimeError, ValueError) as exc:
+                entry.update({"status": "failed", "error": str(exc)})
+        report["files"].append(entry)
+        failures |= entry["status"] == "failed"
+        detail = f" ({entry['error']})" if entry["status"] == "failed" else ""
+        print(f"[{index}/{len(sources)}] {relative}: {entry['status']}{detail}", flush=True)
+    report["summary"] = {status: sum(item["status"] == status for item in report["files"])
+                         for status in ("encoded", "recommended", "kept_source", "skipped_existing", "failed")}
+    if args.report_json is not None:
+        atomic_json(args.report_json.expanduser().resolve(), report)
+    print("Batch summary: " + ", ".join(f"{number} {status}" for status, number in report["summary"].items() if number))
+    return report, failures
 
 
 def summarize(plan: dict[str, Any], source_bytes: int, minimum: float, mode: str) -> dict[str, Any]:
@@ -179,6 +249,9 @@ def print_report(report: dict[str, Any]) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.input.expanduser().is_dir():
+            _, failures = run_folder(args)
+            return 1 if failures else 0
         report, _ = analyze(args)
         print_report(report)
         if report["recommendation"] == "keep_source" and all(x["reason"] == "evaluation_failed" for x in report["candidates"]):

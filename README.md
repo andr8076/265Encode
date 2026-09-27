@@ -58,6 +58,23 @@ quality thresholds, optional audio optimization, and JSON report options.
 For a local diagnostic when VMAF is unavailable, `--metric ssim_percent`
 measures mean SSIM only; its score and thresholds are not interchangeable with
 VMAF or its low-frame checks.
+
+For a folder, analyze and encode each video using settings measured for that
+video:
+
+```bash
+./265Encode.sh --analyze "/path/to/videos" --encode
+./265Encode.sh --analyze "/path/to/videos" --recursive --encode --report-json batch.json
+./265Encode.sh --analyze "/path/to/videos" --recursive --output-dir "/path/to/converted" --encode
+```
+
+Without `--encode`, folder mode only reports recommendations. Each file gets
+its own quality search and sealed execution plan; settings measured on one
+video are not reused blindly for other videos. Existing outputs and generated
+`.hevc.mkv` files are skipped on later runs. `--recursive` includes subfolders,
+and `--output-dir` preserves that layout. A batch JSON report records the
+result for every file. The batch continues after a file fails and returns a
+nonzero status when any file fails.
 ## Hardware policy
 
 Modern backends are tested with bounded real encodes:
